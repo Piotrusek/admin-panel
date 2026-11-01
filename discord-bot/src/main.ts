@@ -41,7 +41,7 @@ try {
     if(message.guild&&message.channel.isThread()&&message.channel.parentId===tickets.suggestionsForumId)
       invalidateSuggestionThread(message.guild,tickets,message.channel);
   });
-  client.on(Events.MessageBulkDelete,(messages,channel)=>{
+  client.on(Events.MessageBulkDelete,(_messages,channel)=>{
     if(channel.isThread()&&channel.guild&&channel.parentId===tickets.suggestionsForumId)
       invalidateSuggestionThread(channel.guild,tickets,channel);
   });
