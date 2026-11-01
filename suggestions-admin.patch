@@ -1,0 +1,565 @@
+diff --git a/discord-bot/.env.example b/discord-bot/.env.example
+index 25e154b..4b8ee7d 100644
+--- a/discord-bot/.env.example
++++ b/discord-bot/.env.example
+@@ -14,3 +14,7 @@ TICKET_CATEGORY_IDS=
+ # Optional forum CHANNEL ID for the Suggestions tab (not its parent category).
+ # Uses the same TICKET_SYNC_URL and TICKET_SYNC_TOKEN connection.
+ SUGGESTIONS_FORUM_ID=
++
++# Optional webhook of the suggestions forum channel. Lets admins add suggestions and set their status from the
++# panel; the bot edits the Discord message through it. Requires SUGGESTIONS_FORUM_ID. Keep it secret.
++SUGGESTIONS_WEBHOOK_URL=
+diff --git a/discord-bot/README.md b/discord-bot/README.md
+index 2cdd395..f7898a1 100644
+--- a/discord-bot/README.md
++++ b/discord-bot/README.md
+@@ -75,4 +75,6 @@ Set `SUGGESTIONS_FORUM_ID` to your suggestions **forum channel ID** in `.env`, t
+ 
+ The panel lists active and archived threads with forum tags and can read their conversations. Users with `suggestions.tags` can apply/remove existing tags on active, unlocked threads; the bot needs **Manage Threads**, **View Channel**, and **Read Message History** in this forum. Up to five applied tags are supported, following [Discord's thread API](https://github.com/discord/discord-api-docs/blob/main/developers/resources/channel.mdx). Tag definitions are managed in Discord. The bot checks the configured forum on every request and rejects stale tag edits. It does not unarchive or unlock threads implicitly.
+ 
++Set `SUGGESTIONS_WEBHOOK_URL` to a webhook created in the suggestions forum channel (Edit Channel → Integrations → Webhooks) to let admins with `suggestions.create` / `suggestions.status` / `suggestions.delete` add suggestions, set their status (Denied, Done, Under consideration, Maybe next season, Waiting for update, Testing, Poll) and delete them from the panel. The bot posts new suggestions through the webhook and, on a status change, edits that webhook message's trailing `**Status:** …` line; it refuses a webhook belonging to another channel. Webhooks can only edit their own messages, so suggestions posted by members cannot receive a status. Deleting a thread needs **Manage Threads**. Keep the webhook URL secret.
++
+ Suggestion replies require Send Messages in Threads in the configured forum. They use the existing staff signature and nonce deduplication; the bot verifies forum membership and rejects archived/locked threads before sending.
+diff --git a/discord-bot/src/conversations.ts b/discord-bot/src/conversations.ts
+index 289fc0b..265357b 100644
+--- a/discord-bot/src/conversations.ts
++++ b/discord-bot/src/conversations.ts
+@@ -1,4 +1,5 @@
+-import { suggestionCommand, suggestionThread, SuggestionError } from './suggestions.js';
++import { suggestionCommand, suggestionThread, SuggestionError, SUGGESTION_ACTIONS } from './suggestions.js';
++import { staffSignature } from './signature.js';
+ import { authorProfiles, profile } from './profiles.js';
+ import { mentionFormatter } from './mentions.js';
+ import { WebSocket } from 'ws';
+@@ -12,7 +13,7 @@ export async function messageView(m:Message,format:ReturnType<typeof mentionForm
+   attachments:[...m.attachments.values()].map(a=>({name:a.name,url:a.url,contentType:a.contentType,size:a.size,width:a.width,height:a.height,spoiler:a.spoiler})),embeds};
+ }
+ export async function conversationCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>) {
+- if(c.action==='suggestions-list'||c.action==='suggestions-tags')return suggestionCommand(guild,config,c);
++ if(SUGGESTION_ACTIONS.includes(String(c.action)))return suggestionCommand(guild,config,c);
+  const suggestion=c.action==='suggestions-history'||c.action==='suggestions-reply';
+  if(suggestion){await suggestionThread(guild,config,c.channel);c={...c,action:c.action==='suggestions-reply'?'reply':'history'};}
+  if(!['history','reply'].includes(String(c.action))||typeof c.channel!=='string'||! /^[1-9][0-9]{16,19}$/.test(c.channel))throw new Error('Invalid command');
+@@ -34,12 +35,8 @@ export async function conversationCommand(guild:Guild,config:TicketConfig,c:Reco
+  if(typeof c.content!=='string'||!c.content.trim()||c.content.length>1800||typeof c.actor!=='string'||c.actor.length>130||typeof c.rank!=='string'||!c.rank.trim()||c.rank.length>32||typeof c.requestId!=='string'||! /^[a-f0-9-]{36}$/.test(c.requestId))throw new Error('Invalid reply');
+  if(channel.isThread()&&(channel.archived||channel.locked))throw new Error('Thread is closed');
+  if(!channel.permissionsFor(me)?.has(channel.isThread()?PermissionFlagsBits.SendMessagesInThreads:PermissionFlagsBits.SendMessages))throw new Error('Send permission required');
+- const identity=c.actor.match(/^(.*) \[([0-9]{17,20})\]$/);
+- let displayName=identity?.[1]??c.actor;
+- if(identity){try{displayName=(await guild.members.fetch(identity[2]!)).displayName;}catch{/* Use the account name without the ID if the member is unavailable. */}}
+- const clean=(value:string)=>value.replace(/[\r\n*_`~<>@\\|]/g,'').slice(0,80);
+- const actor=clean(displayName),rank=clean(c.rank);
+- const message=await channel.send({content:`${c.content}\n\n— ${actor} · ${rank}`,allowedMentions:{parse:[],repliedUser:false},nonce:c.requestId.replaceAll('-','').slice(0,24),enforceNonce:true});
++ const signature=await staffSignature(guild,c.actor,c.rank);
++ const message=await channel.send({content:`${c.content}\n\n${signature}`,allowedMentions:{parse:[],repliedUser:false},nonce:c.requestId.replaceAll('-','').slice(0,24),enforceNonce:true});
+  return {messages:[await messageView(message,mentionFormatter(guild),authorProfiles(guild))],hasMore:false};
+ }
+ export function connectConversations(guild:Guild,config:TicketConfig):()=>void {
+diff --git a/discord-bot/src/main.ts b/discord-bot/src/main.ts
+index 6b3f1b3..89812cd 100644
+--- a/discord-bot/src/main.ts
++++ b/discord-bot/src/main.ts
+@@ -1,4 +1,4 @@
+-import { buildSuggestionIndex, indexSuggestionMessage, invalidateSuggestionThread, removeSuggestionThread } from './suggestions.js';
++import { buildSuggestionIndex, indexSuggestionMessage, invalidateSuggestionThread, removeSuggestionThread, invalidateSuggestionStatus } from './suggestions.js';
+ import { errorDetail } from './errors.js';
+ import { connectConversations } from './conversations.js';
+ import { Client, Events, GatewayIntentBits } from 'discord.js';
+@@ -34,6 +34,8 @@ try {
+   });
+   client.on(Events.MessageCreate,message=>{if(message.guild)indexSuggestionMessage(message.guild,tickets,message);});
+   client.on(Events.MessageUpdate,(_old,message)=>{
++    // A forum post's first message shares its thread's ID; its edits may change the displayed status.
++    if(message.channelId===message.id)invalidateSuggestionStatus(message.id);
+     if(message.guild&&message.channel.isThread()&&message.channel.parentId===tickets.suggestionsForumId)
+       invalidateSuggestionThread(message.guild,tickets,message.channel);
+   });
+@@ -47,7 +49,7 @@ try {
+   });
+   client.on(Events.ThreadCreate,thread=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
+   client.on(Events.ThreadUpdate,(_old,thread)=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
+-  client.on(Events.ThreadDelete,thread=>{if(thread.parentId===tickets.suggestionsForumId)removeSuggestionThread(thread.guild,thread.id);});
++  client.on(Events.ThreadDelete,thread=>{if(thread.parentId===tickets.suggestionsForumId)removeSuggestionThread(thread.guild,thread.id);invalidateSuggestionStatus(thread.id);});
+   client.on(Events.Error,error=>report('Discord connection error',error));
+   for(const signal of ['SIGINT','SIGTERM'] as const)process.once(signal,()=>{console.log('Stopping Discord bot.');clearInterval(ticketTimer);stopConversations();client?.destroy();});
+   await client.login(config.token);
+diff --git a/discord-bot/src/signature.ts b/discord-bot/src/signature.ts
+new file mode 100644
+index 0000000..2c59339
+--- /dev/null
++++ b/discord-bot/src/signature.ts
+@@ -0,0 +1,10 @@
++import type { Guild } from 'discord.js';
++const clean=(value:string)=>value.replace(/[\r\n*_`~<>@\\|]/g,'').slice(0,80);
++// "— Name · Rank" footer used for staff replies and webhook-posted suggestions.
++// The panel sends actors as "Account name [discordId]"; prefer the server nickname when the member is available.
++export async function staffSignature(guild:Guild,actor:string,rank:string):Promise<string> {
++ const identity=actor.match(/^(.*) \[([0-9]{17,20})\]$/);
++ let displayName=identity?.[1]??actor;
++ if(identity){try{displayName=(await guild.members.fetch(identity[2]!)).displayName;}catch{/* Use the account name without the ID if the member is unavailable. */}}
++ return `— ${clean(displayName)} · ${clean(rank)}`;
++}
+diff --git a/discord-bot/src/suggestions.ts b/discord-bot/src/suggestions.ts
+index 84cbb86..ac0cffa 100644
+--- a/discord-bot/src/suggestions.ts
++++ b/discord-bot/src/suggestions.ts
+@@ -1,6 +1,45 @@
+-import { ChannelType, PermissionFlagsBits, type Guild, type ThreadChannel, type ForumChannel, type Message } from 'discord.js';
+-import type { TicketConfig } from './tickets.js';
++import { ChannelType, PermissionFlagsBits, WebhookClient, type Guild, type ThreadChannel, type ForumChannel, type Message } from 'discord.js';
++import { WEBHOOK_URL, type TicketConfig } from './tickets.js';
++import { staffSignature } from './signature.js';
+ export class SuggestionError extends Error {constructor(public code:string){super(code);}}
++export const SUGGESTION_ACTIONS=['suggestions-list','suggestions-tags','suggestions-status','suggestions-create','suggestions-delete'];
++// Keep in sync with web-server/src/suggestion-statuses.ts (a web test checks this).
++export const SUGGESTION_STATUSES=['Denied','Done','Under consideration','Maybe next season','Waiting for update','Testing','Poll'] as const;
++export type SuggestionStatus=typeof SUGGESTION_STATUSES[number];
++// The status lives in the last line of the suggestion's first message, edited through the webhook that posted it.
++const STATUS_LINE=/\n*\*\*Status:\*\* ([^\n]+?)\s*$/;
++export const statusOf=(content:string):SuggestionStatus|null=>{const m=STATUS_LINE.exec(content);return SUGGESTION_STATUSES.find(s=>s===m?.[1])??null;};
++export const withStatus=(content:string,status:SuggestionStatus)=>content.replace(STATUS_LINE,'').trimEnd()+'\n\n**Status:** '+status;
++interface WebhookLike {
++ send(options:{content:string;threadName:string;allowedMentions:{parse:[]}}):Promise<{channel_id:string}>;
++ fetchMessage(id:string,options:{threadId:string}):Promise<{content:string}>;
++ editMessage(id:string,options:{content:string;threadId:string;allowedMentions:{parse:[]}}):Promise<unknown>;
++}
++export interface SuggestionDeps {webhook?:(guild:Guild,forum:ForumChannel,config:TicketConfig)=>Promise<WebhookLike>}
++const verified=new Map<string,WebhookClient>();
++async function defaultWebhook(guild:Guild,forum:ForumChannel,config:TicketConfig):Promise<WebhookLike> {
++ const match=config.suggestionsWebhookUrl?WEBHOOK_URL.exec(config.suggestionsWebhookUrl):null;
++ if(!match)throw new SuggestionError('suggestions-webhook-unconfigured');
++ const cached=verified.get(forum.id);if(cached)return cached as unknown as WebhookLike;
++ // Refuse a webhook that belongs to some other channel before any message is sent through it.
++ const info=await guild.client.fetchWebhook(match[1]!,match[2]!);
++ if(info.channelId!==forum.id||info.guildId!==guild.id)throw new SuggestionError('suggestions-webhook-mismatch');
++ const client=new WebhookClient({id:match[1]!,token:match[2]!});verified.set(forum.id,client);
++ return client as unknown as WebhookLike;
++}
++const statuses=new Map<string,SuggestionStatus|null>();
++export const invalidateSuggestionStatus=(id:string)=>{statuses.delete(id);};
++async function loadStatuses(threads:ThreadChannel[]) {
++ const missing=threads.filter(t=>!statuses.has(t.id));let next=0;
++ await Promise.all(Array.from({length:Math.min(6,missing.length)},async()=>{
++  while(next<missing.length){
++   const t=missing[next++]!;
++   try{statuses.set(t.id,statusOf((await t.fetchStarterMessage({cache:false}))?.content??''));}
++   catch{/* Starter message deleted or unreadable: show no status and retry on the next list. */}
++  }
++ }));
++ if(statuses.size>5000)for(const key of [...statuses.keys()].slice(0,1000))statuses.delete(key);
++}
+ const snowflake=(v:unknown):v is string=>typeof v==='string'&&/^[1-9][0-9]{16,19}$/.test(v);
+ export async function suggestionForum(guild:Guild,config:TicketConfig) {
+  if(!config.suggestionsForumId)throw new SuggestionError('suggestions-unconfigured');
+@@ -19,7 +58,7 @@ export async function suggestionThread(guild:Guild,config:TicketConfig,id:unknow
+ export const activityId=(t:Pick<ThreadChannel,'id'|'lastMessageId'>)=>BigInt(t.lastMessageId??t.id);
+ export const newestActivity=(a:Pick<ThreadChannel,'id'|'lastMessageId'>,b:Pick<ThreadChannel,'id'|'lastMessageId'>)=>activityId(a)>activityId(b)?-1:activityId(a)<activityId(b)?1:BigInt(a.id)>BigInt(b.id)?-1:BigInt(a.id)<BigInt(b.id)?1:0;
+ const archives=new WeakMap<Guild,Map<string,{expires:number;threads:ThreadChannel[]}>>();
+-const row=(t:ThreadChannel)=>({id:t.id,name:t.name,guildId:t.guild.id,tagIds:t.appliedTags,archived:!!t.archived,locked:!!t.locked,createdAt:t.createdTimestamp,lastMessageAt:Number(activityId(t)>>22n)+1420070400000});
++const row=(t:ThreadChannel)=>({status:statuses.get(t.id)??null,id:t.id,name:t.name,guildId:t.guild.id,tagIds:t.appliedTags,archived:!!t.archived,locked:!!t.locked,createdAt:t.createdTimestamp,lastMessageAt:Number(activityId(t)>>22n)+1420070400000});
+ const editing=new Set<string>();
+ // A bounded, in-memory index. Startup indexing is asynchronous, not on the search path.
+ interface IndexedThread {thread:ThreadChannel;messages:Map<string,string>}
+@@ -117,7 +156,7 @@ export async function buildSuggestionIndex(guild:Guild,config:TicketConfig) {
+  }finally{idx.loading=false;}
+ }
+ 
+-export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>):Promise<{messages:unknown[];hasMore:boolean}> {
++export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps={}):Promise<{messages:unknown[];hasMore:boolean}> {
+  if(c.action==='suggestions-list'){
+   if(c.query!==undefined&&(typeof c.query!=='string'||c.query.length>160))throw new Error('Invalid search query');
+   const needle=typeof c.query==='string'?c.query.trim().toLocaleLowerCase():'';
+@@ -142,9 +181,13 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
+   }
+   all.sort(newestActivity);
+   threads=all.slice(offset,offset+24);hasMore=offset+24<all.length;cursor=String(offset+24);
++  await loadStatuses(threads);
+ 
+   return {messages:[{forumId:forum.id,name:forum.name,guildId:guild.id,tags:forum.availableTags.map(t=>({id:t.id,name:t.name,moderated:t.moderated})),cursor,indexing:needle?indexFor(guild).loading:false,indexed:needle?indexFor(guild).indexed:undefined,total:needle?indexFor(guild).total:undefined},...threads.map(row)],hasMore};
+  }
++ if(c.action==='suggestions-create')return createSuggestion(guild,config,c,deps);
++ if(c.action==='suggestions-status')return changeStatus(guild,config,c,deps);
++ if(c.action==='suggestions-delete')return deleteSuggestion(guild,config,c);
+  if(c.action!=='suggestions-tags')throw new Error('Unknown suggestion command');
+  if(!snowflake(c.channel)||editing.has(c.channel))throw new Error('Tag edit in progress');
+  editing.add(c.channel);
+@@ -160,3 +203,54 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
+   return {messages:[row(updated)],hasMore:false};
+  }finally{editing.delete(c.channel);}
+ }
++
++const staff=(c:Record<string,unknown>)=>{
++ if(typeof c.actor!=='string'||!c.actor||c.actor.length>130||typeof c.rank!=='string'||!c.rank.trim()||c.rank.length>32)throw new Error('Invalid staff identity');
++ return {actor:c.actor,rank:c.rank};
++};
++async function createSuggestion(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps) {
++ if(typeof c.title!=='string'||!c.title.trim()||c.title.trim().length>100||typeof c.content!=='string'||!c.content.trim()||c.content.length>1700)throw new Error('Invalid suggestion');
++ const {actor,rank}=staff(c),forum=await suggestionForum(guild,config);
++ const hook=await (deps.webhook??defaultWebhook)(guild,forum,config);
++ const content=`${c.content.trim()}\n\n${await staffSignature(guild,actor,rank)}`;
++ const sent=await hook.send({content,threadName:c.title.trim(),allowedMentions:{parse:[]}});
++ const {thread}=await suggestionThread(guild,config,sent.channel_id);
++ statuses.set(thread.id,null);
++ return {messages:[row(thread)],hasMore:false};
++}
++async function changeStatus(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps) {
++ const status=SUGGESTION_STATUSES.find(s=>s===c.status);
++ if(!snowflake(c.channel)||!status||c.expected!==undefined&&c.expected!==null&&!SUGGESTION_STATUSES.some(s=>s===c.expected))throw new Error('Invalid suggestion status');
++ staff(c);
++ if(editing.has(c.channel))throw new Error('Suggestion edit in progress');
++ editing.add(c.channel);
++ try{
++  const {forum,thread}=await suggestionThread(guild,config,c.channel);
++  if(thread.archived||thread.locked)throw new SuggestionError('suggestions-readonly');
++  const hook=await (deps.webhook??defaultWebhook)(guild,forum,config);
++  // The first post of a forum thread has the thread's ID. The webhook can only read and edit its own messages.
++  let current:{content:string};
++  try{current=await hook.fetchMessage(thread.id,{threadId:thread.id});}
++  catch{throw new SuggestionError('suggestions-status-unsupported');}
++  if(c.expected!==undefined&&statusOf(current.content)!==c.expected)throw new SuggestionError('suggestions-conflict');
++  const content=withStatus(current.content,status);
++  if(content.length>2000)throw new SuggestionError('suggestions-too-long');
++  await hook.editMessage(thread.id,{content,threadId:thread.id,allowedMentions:{parse:[]}});
++  statuses.set(thread.id,status);
++  return {messages:[row(thread)],hasMore:false};
++ }finally{editing.delete(c.channel);}
++}
++async function deleteSuggestion(guild:Guild,config:TicketConfig,c:Record<string,unknown>) {
++ if(!snowflake(c.channel))throw new Error('Invalid thread');
++ const {actor}=staff(c);
++ if(editing.has(c.channel))throw new Error('Suggestion edit in progress');
++ editing.add(c.channel);
++ try{
++  const {thread}=await suggestionThread(guild,config,c.channel);
++  const me=await guild.members.fetchMe();
++  if(!thread.permissionsFor(me)?.has(PermissionFlagsBits.ManageThreads))throw new SuggestionError('suggestions-readonly');
++  await thread.delete('Admin panel: suggestion removed by '+actor.replace(/[\r\n]/g,' ').slice(0,100));
++  removeSuggestionThread(guild,thread.id);statuses.delete(thread.id);
++  return {messages:[],hasMore:false};
++ }finally{editing.delete(c.channel);}
++}
+diff --git a/discord-bot/src/tickets.ts b/discord-bot/src/tickets.ts
+index 94642e3..801a95d 100644
+--- a/discord-bot/src/tickets.ts
++++ b/discord-bot/src/tickets.ts
+@@ -5,10 +5,15 @@ export const TICKET_CATEGORIES = [{"id": "lost-items-or-airship", "label": "Lost
+ export const UNCATEGORIZED_TICKET = {id:'uncategorized',label:'Uncategorized'} as const;
+ 
+ export interface Ticket { id:string; name:string; category:string; guildId:string; tags:string[] }
+-export interface TicketConfig { suggestionsForumId?:string; categoryIds:string[]; rules:{id:string;label:string;pattern:string}[]; url?:string; token?:string }
++export interface TicketConfig { suggestionsForumId?:string; suggestionsWebhookUrl?:string; categoryIds:string[]; rules:{id:string;label:string;pattern:string}[]; url?:string; token?:string }
++// A Discord webhook URL; the token is a secret and is never included in error messages.
++export const WEBHOOK_URL=/^https:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/api(?:\/v[0-9]+)?\/webhooks\/([0-9]{17,20})\/([A-Za-z0-9_-]{20,100})$/;
+ export function ticketConfig(env:NodeJS.ProcessEnv=process.env):TicketConfig {
+  const suggestionsForumId=env.SUGGESTIONS_FORUM_ID?.trim()||undefined;
+  if(suggestionsForumId&&!/^[1-9][0-9]{16,19}$/.test(suggestionsForumId))throw new Error('Invalid SUGGESTIONS_FORUM_ID');
++ const suggestionsWebhookUrl=env.SUGGESTIONS_WEBHOOK_URL?.trim()||undefined;
++ if(suggestionsWebhookUrl&&!WEBHOOK_URL.test(suggestionsWebhookUrl))throw new Error('Invalid SUGGESTIONS_WEBHOOK_URL');
++ if(suggestionsWebhookUrl&&!suggestionsForumId)throw new Error('Set SUGGESTIONS_FORUM_ID before SUGGESTIONS_WEBHOOK_URL');
+  const categoryIds=(env.TICKET_CATEGORY_IDS||'').split(',').map(s=>s.trim()).filter(Boolean);
+  if(categoryIds.some(id=>! /^[1-9][0-9]{16,19}$/.test(id)))throw new Error('Invalid TICKET_CATEGORY_IDS');
+  let overrides:Record<string, {pattern?:string;label?:string}>={};
+@@ -28,7 +33,7 @@ export function ticketConfig(env:NodeJS.ProcessEnv=process.env):TicketConfig {
+   if(!token||! /^[A-Za-z0-9_-]{43,128}$/.test(token))throw new Error('Set TICKET_SYNC_TOKEN to a random 43–128 character URL-safe secret');
+   if(!categoryIds.length&&!suggestionsForumId)throw new Error('Set TICKET_CATEGORY_IDS before enabling sync');
+  }
+- return {categoryIds,rules,url,token,suggestionsForumId};
++ return {categoryIds,rules,url,token,suggestionsForumId,...(suggestionsWebhookUrl?{suggestionsWebhookUrl}:{})};
+ }
+ export function matches(name:string,pattern:string):boolean {
+  // Only literal lowercase letters, digits and hyphens plus wildcard * are allowed.
+diff --git a/discord-bot/test/bot.test.ts b/discord-bot/test/bot.test.ts
+index 93c45c1..8e76173 100644
+--- a/discord-bot/test/bot.test.ts
++++ b/discord-bot/test/bot.test.ts
+@@ -253,3 +253,62 @@ test('background suggestion index finds message bodies across pages and follows
+  for(let i=0;i<20&&(await query('hidden hangar')).length;i++)await new Promise(resolve=>setTimeout(resolve,10));
+  assert.equal((await query('hidden hangar')).length,0,'deletions remove stale text');
+ });
++
++import { statusOf, withStatus, SUGGESTION_STATUSES } from '../src/suggestions.js';
++test('suggestion status is a single trailing line that is replaced, never duplicated',()=>{
++ assert.deepEqual([...SUGGESTION_STATUSES],['Denied','Done','Under consideration','Maybe next season','Waiting for update','Testing','Poll']);
++ assert.equal(statusOf('Add a spawn station'),null);
++ const first=withStatus('Add a spawn station\n\n— Staff · admin','Testing');
++ assert.equal(first,'Add a spawn station\n\n— Staff · admin\n\n**Status:** Testing');assert.equal(statusOf(first),'Testing');
++ const second=withStatus(first,'Under consideration');
++ assert.equal(second,'Add a spawn station\n\n— Staff · admin\n\n**Status:** Under consideration');assert.equal(second.match(/Status/g)!.length,1);
++ assert.equal(statusOf('Status: Done'),null);assert.equal(statusOf('**Status:** Invented'),null);
++});
++
++test('webhook configuration is validated without echoing its token',()=>{
++ const forum='12345678901234567',token='a'.repeat(40),url='https://discord.com/api/webhooks/12345678901234568/'+token;
++ assert.equal(ticketConfig({SUGGESTIONS_FORUM_ID:forum,SUGGESTIONS_WEBHOOK_URL:url}).suggestionsWebhookUrl,url);
++ assert.equal(ticketConfig({SUGGESTIONS_FORUM_ID:forum}).suggestionsWebhookUrl,undefined);
++ for(const bad of ['http://discord.com/api/webhooks/12345678901234568/'+token,'https://example.com/api/webhooks/12345678901234568/'+token,'https://discord.com/api/webhooks/1/'+token]){
++  assert.throws(()=>ticketConfig({SUGGESTIONS_FORUM_ID:forum,SUGGESTIONS_WEBHOOK_URL:bad}),error=>error instanceof Error&&!error.message.includes(token));
++ }
++ assert.throws(()=>ticketConfig({SUGGESTIONS_WEBHOOK_URL:url}),/SUGGESTIONS_FORUM_ID/);
++});
++
++test('admin suggestion commands create via webhook, edit its message status, and delete threads',async()=>{
++ const forumId='12345678901234567',threadId='12345678901234568',other='12345678901234571';
++ const config=ticketConfig({SUGGESTIONS_FORUM_ID:forumId});
++ const thread:any={id:threadId,name:'Build a spawn station',guild:{id:'12345678901234570'},parentId:forumId,viewable:true,isThread:()=>true,appliedTags:[],archived:false,locked:false,createdTimestamp:1,permissionsFor:()=>({has:()=>allowed}),deleted:0,delete:async()=>{thread.deleted++;}};
++ let allowed=true,stored='Build a spawn station\n\n— Staff · admin',sent:any,edited:any,failFetch=false;
++ const forum={id:forumId,name:'Suggestions',type:ChannelType.GuildForum,viewable:true,permissionsFor:()=>({has:()=>true}),availableTags:[]};
++ const guild={id:'12345678901234570',members:{fetchMe:async()=>({}),fetch:async()=>{throw new Error('no member');}},channels:{fetch:async(id:string)=>id===forumId?forum:id===threadId?thread:null}} as unknown as Guild;
++ const deps={webhook:async()=>({
++  send:async(o:any)=>{sent=o;return {channel_id:threadId};},
++  fetchMessage:async(id:string,o:any)=>{assert.equal(id,threadId);assert.equal(o.threadId,threadId);if(failFetch)throw new Error('Unknown Message');return {content:stored};},
++  editMessage:async(id:string,o:any)=>{assert.equal(id,threadId);edited=o;stored=o.content;return {};}
++ })};
++ const staff={actor:'Alex [12345678901234569]',rank:'admin'};
++ const created=await suggestionCommand(guild,config,{action:'suggestions-create',title:' Build a spawn station ',content:'Please add one @everyone',...staff},deps);
++ assert.equal(sent.threadName,'Build a spawn station');assert.deepEqual(sent.allowedMentions,{parse:[]});assert(sent.content.endsWith('\n\n— Alex · admin'));
++ assert.equal((created.messages[0] as any).status,null);
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'',content:'x',...staff},deps),/Invalid suggestion/);
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t'.repeat(101),content:'x',...staff},deps),/Invalid suggestion/);
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t',content:'x'.repeat(1701),...staff},deps),/Invalid suggestion/);
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t',content:'x'},deps),/Invalid staff identity/);
++
++ const changed=await suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Maybe next season',expected:null,...staff},deps);
++ assert.equal(edited.content,'Build a spawn station\n\n— Staff · admin\n\n**Status:** Maybe next season');assert.equal(edited.threadId,threadId);assert.deepEqual(edited.allowedMentions,{parse:[]});
++ assert.equal((changed.messages[0] as any).status,'Maybe next season');
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Done',expected:'Poll',...staff},deps),/suggestions-conflict/);
++ await suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Done',expected:'Maybe next season',...staff},deps);
++ assert.equal(stored.match(/Status/g)!.length,1);assert(stored.endsWith('**Status:** Done'));
++ for(const status of ['Invented','',undefined])await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status,...staff},deps),/Invalid suggestion status/);
++ failFetch=true;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},deps),/suggestions-status-unsupported/);failFetch=false;
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},{}),/suggestions-webhook-unconfigured/);
++ stored='x'.repeat(1990);await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Testing',...staff},deps),/suggestions-too-long/);
++ thread.locked=true;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},deps),/suggestions-readonly/);thread.locked=false;
++
++ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-delete',channel:other,...staff}));
++ allowed=false;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-delete',channel:threadId,...staff}),/suggestions-readonly/);assert.equal(thread.deleted,0);allowed=true;
++ assert.deepEqual(await suggestionCommand(guild,config,{action:'suggestions-delete',channel:threadId,...staff}),{messages:[],hasMore:false});assert.equal(thread.deleted,1);
++});
+diff --git a/src/main/java/com/zaremate/admin_panel/Permissions.java b/src/main/java/com/zaremate/admin_panel/Permissions.java
+index 28542db..21b8550 100644
+--- a/src/main/java/com/zaremate/admin_panel/Permissions.java
++++ b/src/main/java/com/zaremate/admin_panel/Permissions.java
+@@ -2,7 +2,7 @@ package com.zaremate.admin_panel;
+ import java.util.*;
+ import com.google.gson.*;
+ final class Permissions {
+- static final Set<String> ALL=Set.of("suggestions.reply", "tab.todo", "todo.create", "todo.edit", "todo.delete", "tab.suggestions", "suggestions.tags", "tickets.reply", "tab.tickets", "tickets.lost-items-or-airship", "tickets.other-support", "tickets.cant-connect-to-the-server", "tickets.buy-a-shop-plot-at-spawn", "tickets.stealing-or-grieffing", "tickets.player-report", "tickets.report", "tickets.uncategorized", "panel.access", "tab.players", "tab.overview", "tab.cases", "tab.notes", "tab.security", "tab.inventory", "tab.enderChest", "tab.curios", "tab.audit", "access.manage", "notes.add", "notes.edit", "notes.remove", "punish.warn", "punish.kick", "punish.mute", "punish.ban", "punish.offense", "punish.remove", "punish.revoke");
++ static final Set<String> ALL=Set.of("suggestions.reply", "tab.todo", "todo.create", "todo.edit", "todo.delete", "tab.suggestions", "suggestions.tags", "suggestions.status", "suggestions.create", "suggestions.delete", "tickets.reply", "tab.tickets", "tickets.lost-items-or-airship", "tickets.other-support", "tickets.cant-connect-to-the-server", "tickets.buy-a-shop-plot-at-spawn", "tickets.stealing-or-grieffing", "tickets.player-report", "tickets.report", "tickets.uncategorized", "panel.access", "tab.players", "tab.overview", "tab.cases", "tab.notes", "tab.security", "tab.inventory", "tab.enderChest", "tab.curios", "tab.audit", "access.manage", "notes.add", "notes.edit", "notes.remove", "punish.warn", "punish.kick", "punish.mute", "punish.ban", "punish.offense", "punish.remove", "punish.revoke");
+  static Set<String> parse(JsonArray values) {
+   if(values==null)throw new IllegalArgumentException("Explicit permissions required");
+   Set<String> out=new HashSet<>();
+diff --git a/web-server/README.md b/web-server/README.md
+index 8866186..91f69bb 100644
+--- a/web-server/README.md
++++ b/web-server/README.md
+@@ -181,6 +181,8 @@ Grant `tab.todo` plus the required `todo.create`, `todo.edit`, and/or `todo.dele
+ 
+ Grant `tab.suggestions` to read suggestions and `suggestions.tags` to apply/remove the forum's existing tags (up to five per thread). This edits applied tags, not the forum's tag definitions. Tags are checked against the configured forum and current thread tags before saving. Archived/locked threads are readable but cannot be retagged here; reopen them in Discord first. The bot needs View Channel, Read Message History and Manage Threads for tag edits. Tag operations are audited. Grant `suggestions.reply` alongside `tab.suggestions` to respond from the panel. Replies use the same server-nickname/rank signature, disabled mention pings, CSRF checks, duplicate-send protection and audit logging as ticket replies. Archived or locked threads must be reopened in Discord first.
+ 
++**Admin controls.** Three more permissions, granted in Rank access (legacy `admin` accounts get them automatically): `suggestions.status` changes a suggestion's status, `suggestions.create` posts a new suggestion, and `suggestions.delete` deletes a suggestion's thread. Statuses are fixed: Denied, Done, Under consideration, Maybe next season, Waiting for update, Testing, Poll. Posting and status edits go through the Discord webhook configured as `SUGGESTIONS_WEBHOOK_URL` in the bot's `.env` (a webhook of the suggestions forum channel). A status is stored as a final `**Status:** …` line of the suggestion's first message, which the bot edits through that webhook, so the Discord post always shows the current status. The webhook can only edit messages it posted: suggestions created from the panel work, but threads started by community members cannot get a status and the panel reports that. Status changes use a version check (a conflict asks you to refresh). Deleting removes the whole Discord thread and needs Manage Threads for the bot. All three actions are written to the audit log.
++
+ “Create task” links a suggestion to the To-do board and requires both `tab.todo` and `todo.create`. Duplicate imports of the same suggestion are rejected. All new permissions appear in Rank access; existing explicit grants are unchanged. Restart both services after deploying, and restart the web service/sign in again after changing rank permissions.
+ 
+ Tasks can be dragged between status columns by users with `todo.edit`. A status dropdown on each card provides the same action for keyboard/touch users. Moves save immediately with the existing version check; failed moves keep the original position. Dragging is disabled while saving or editing a task.
+diff --git a/web-server/client/Suggestions.tsx b/web-server/client/Suggestions.tsx
+index 8e2c8a2..7ac2589 100644
+--- a/web-server/client/Suggestions.tsx
++++ b/web-server/client/Suggestions.tsx
+@@ -1,12 +1,17 @@
+ import { useEffect,useRef,useState } from 'react';
+ import type { Api,Session } from './types';
+ import { has } from '../src/permissions';
++import { SUGGESTION_STATUSES } from '../src/suggestion-statuses';
+ import { TicketConversation } from './TicketConversation';
+-interface Thread {id:string;name:string;guildId:string;tagIds:string[];archived:boolean;locked:boolean}
++interface Thread {id:string;name:string;guildId:string;tagIds:string[];archived:boolean;locked:boolean;status:string|null}
++function requestId(){const bytes=crypto.getRandomValues(new Uint8Array(16));return [...bytes].map(b=>b.toString(16).padStart(2,'0')).join('').replace(/^(........)(....)(....)(....)(............)$/,'$1-$2-$3-$4-$5');}
++const statusClass=(s:string|null)=>'suggestion-status'+(s?' status-'+s.toLowerCase().replace(/[^a-z]+/g,'-'):' status-none');
+ interface Meta {name:string;forumId:string;guildId:string;cursor?:string;indexing?:boolean;indexed?:number;total?:number;tags:{id:string;name:string;moderated:boolean}[]}
+ interface Page {meta:Meta;threads:Thread[];hasMore:boolean}
+ export function Suggestions({api,session}:{api:Api;session:Session}) {
+  const cache=useRef(new Map<string,{page:Page;at:number}>());
++ const attempt=useRef<{key:string;id:string}|null>(null),after=useRef('');
++ const [status,setStatus]=useState(''),[composing,setComposing]=useState(false),[draftTitle,setDraftTitle]=useState(''),[draftContent,setDraftContent]=useState('');
+  const [loading,setLoading]=useState(false),[pageKey,setPageKey]=useState('');
+  const [untagged,setUntagged]=useState(false);
+  const [filterTags,setFilterTags]=useState<string[]>([]),[search,setSearch]=useState(''),[query,setQuery]=useState('');
+@@ -16,7 +21,7 @@ export function Suggestions({api,session}:{api:Api;session:Session}) {
+  const ready=pageKey===key;
+  const searching=query.length>0;
+  useEffect(()=>{
+-  let stopped=false;setSelected(null);setNotice('');setError('');
++  let stopped=false;setSelected(null);setNotice(after.current);after.current='';setError('');
+   const cached=cache.current.get(key);
+   if(cached){setPage(cached.page);setPageKey(key);}
+   if(cached&&Date.now()-cached.at<30000){setLoading(false);return;}
+@@ -35,11 +40,13 @@ export function Suggestions({api,session}:{api:Api;session:Session}) {
+  },[query,page?.meta.indexing,page?.meta.indexed,key,ready]);
+  const visible=page?.threads??[];
+  const names=(ids:string[])=>ids.map(id=>page?.meta.tags.find(t=>t.id===id)?.name??'Unknown tag');
+- return <section className="card" id="suggestions" aria-busy={loading}><div className="section-header"><div><h2>{page?.meta.name??'Server suggestions'}</h2><p className="muted">Ideas from the community. Review, label, and turn them into work.</p></div><button className="secondary" disabled={busy} onClick={()=>{cache.current.clear();setRefresh(v=>v+1);}}>Refresh suggestions</button></div><div className="filter-tabs">{[false,true].map(v=><button key={String(v)} disabled={busy} className={archived===v?'selected':''} onClick={()=>{setArchived(v);setCursor('');setPrevious([]);}}>{v?'Archived':'Active'}</button>)}</div>
++ return <section className="card" id="suggestions" aria-busy={loading}><div className="section-header"><div><h2>{page?.meta.name??'Server suggestions'}</h2><p className="muted">Ideas from the community. Review, label, and turn them into work.</p></div><div className="board-actions">{has(session,'suggestions.create')&&<button className="primary" disabled={busy} aria-expanded={composing} onClick={()=>setComposing(!composing)}>{composing?'Cancel':'New suggestion'}</button>}<button className="secondary" disabled={busy} onClick={()=>{cache.current.clear();setRefresh(v=>v+1);}}>Refresh suggestions</button></div></div><div className="filter-tabs">{[false,true].map(v=><button key={String(v)} disabled={busy} className={archived===v?'selected':''} onClick={()=>{setArchived(v);setCursor('');setPrevious([]);}}>{v?'Archived':'Active'}</button>)}</div>
++ {composing&&has(session,'suggestions.create')&&<form className="suggestion-composer" onSubmit={async e=>{e.preventDefault();if(busy||!draftTitle.trim()||!draftContent.trim())return;const key=draftTitle+'\n'+draftContent;if(attempt.current?.key!==key)attempt.current={key,id:requestId()};setBusy(true);setError('');setNotice('');try{await api('/suggestions',{title:draftTitle.trim(),content:draftContent.trim()},attempt.current.id);attempt.current=null;cache.current.clear();setDraftTitle('');setDraftContent('');setComposing(false);setArchived(false);setCursor('');setPrevious([]);after.current='Suggestion posted to Discord.';setRefresh(v=>v+1);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}><h3>New suggestion</h3><p className="muted">Posted to the suggestions forum through the webhook, signed with your name and rank.</p><input aria-label="Suggestion title" placeholder="Title" maxLength={100} value={draftTitle} onChange={e=>setDraftTitle(e.target.value)}/><textarea aria-label="Suggestion details" placeholder="Describe the suggestion" maxLength={1700} rows={5} value={draftContent} onChange={e=>setDraftContent(e.target.value)}/><button className="primary" type="submit" disabled={busy||!draftTitle.trim()||!draftContent.trim()}>Post suggestion</button></form>}
+  {error&&<p className="banner error" role="alert">{error}</p>}{notice&&<p className="notice" role="status">{notice}</p>}
+  {!page&&!error&&<p className="loading">Loading forum suggestions…</p>}
+- {page&&<><div className="suggestion-filters"><input aria-label="Search all suggestions and their messages" placeholder="Search all suggestions and messages…" value={search} onChange={e=>{setSearch(e.target.value);setCursor('');setPrevious([]);}}/><div className="suggestion-filter-tags" aria-label="Filter suggestions by tags"><span>Tags · match all</span><button className={untagged?'selected':''} aria-pressed={untagged} disabled={busy} onClick={()=>{setUntagged(!untagged);setFilterTags([]);setCursor('');setPrevious([]);}}>No tags</button>{page.meta.tags.map(t=><button key={t.id} className={filterTags.includes(t.id)?'selected':''} aria-pressed={filterTags.includes(t.id)} disabled={busy} onClick={()=>{setUntagged(false);setFilterTags(filterTags.includes(t.id)?filterTags.filter(id=>id!==t.id):[...filterTags,t.id]);setCursor('');setPrevious([]);}}>{t.name}</button>)}{(untagged||filterTags.length>0)&&<button className="clear-tags" onClick={()=>{setUntagged(false);setFilterTags([]);setCursor('');setPrevious([]);}}>Clear filters</button>}</div><small className="suggestion-load-status" role="status">{loading?'Updating suggestions… · ':!ready?'Showing previous results · ':''}{searching?(page.meta.indexing?`Indexing suggestions (${page.meta.indexed??0}/${page.meta.total??'…'}) · Results may be incomplete · `:'Searching indexed suggestions · '):'Newest activity first · '}{visible.length} shown on this page{page.hasMore?' · more pages available':''}</small></div><div className="suggestion-grid">{visible.map(t=><button className={'suggestion-card '+(selected?.id===t.id?'selected':'')} key={t.id} disabled={busy||!ready||loading} onClick={()=>{setSelected(t);setTags(t.tagIds);setNotice('');}}><span className="suggestion-row-mark">#</span><strong>{t.name}</strong><span className="ticket-tags">{names(t.tagIds).map((n,i)=><span key={i}>{n}</span>)}</span></button>)}</div>{!visible.length&&<p className="empty">{searching?(page.meta.indexing?'Indexing messages. More results may appear shortly.':'No suggestions match your search.'):'No suggestions match the selected filters.'}{page.hasMore?' Try the next page.':''}</p>}<div className="ticket-pagination"><button className="secondary" disabled={!previous.length||busy||!ready||loading} onClick={()=>{setCursor(previous.at(-1)!);setPrevious(previous.slice(0,-1));}}>Previous</button><button className="secondary" disabled={!page.hasMore||!page.meta.cursor||busy||!ready||loading} onClick={()=>{setPrevious([...previous,cursor]);setCursor(page.meta.cursor!);}}>Next</button></div>
++ {page&&<><div className="suggestion-filters"><input aria-label="Search all suggestions and their messages" placeholder="Search all suggestions and messages…" value={search} onChange={e=>{setSearch(e.target.value);setCursor('');setPrevious([]);}}/><div className="suggestion-filter-tags" aria-label="Filter suggestions by tags"><span>Tags · match all</span><button className={untagged?'selected':''} aria-pressed={untagged} disabled={busy} onClick={()=>{setUntagged(!untagged);setFilterTags([]);setCursor('');setPrevious([]);}}>No tags</button>{page.meta.tags.map(t=><button key={t.id} className={filterTags.includes(t.id)?'selected':''} aria-pressed={filterTags.includes(t.id)} disabled={busy} onClick={()=>{setUntagged(false);setFilterTags(filterTags.includes(t.id)?filterTags.filter(id=>id!==t.id):[...filterTags,t.id]);setCursor('');setPrevious([]);}}>{t.name}</button>)}{(untagged||filterTags.length>0)&&<button className="clear-tags" onClick={()=>{setUntagged(false);setFilterTags([]);setCursor('');setPrevious([]);}}>Clear filters</button>}</div><small className="suggestion-load-status" role="status">{loading?'Updating suggestions… · ':!ready?'Showing previous results · ':''}{searching?(page.meta.indexing?`Indexing suggestions (${page.meta.indexed??0}/${page.meta.total??'…'}) · Results may be incomplete · `:'Searching indexed suggestions · '):'Newest activity first · '}{visible.length} shown on this page{page.hasMore?' · more pages available':''}</small></div><div className="suggestion-grid">{visible.map(t=><button className={'suggestion-card '+(selected?.id===t.id?'selected':'')} key={t.id} disabled={busy||!ready||loading} onClick={()=>{setSelected(t);setTags(t.tagIds);setStatus(t.status??'');setNotice('');}}><span className="suggestion-row-mark">#</span><strong>{t.name}</strong><span className="ticket-tags"><span className={statusClass(t.status)}>{t.status??'No status'}</span>{names(t.tagIds).map((n,i)=><span key={i}>{n}</span>)}</span></button>)}</div>{!visible.length&&<p className="empty">{searching?(page.meta.indexing?'Indexing messages. More results may appear shortly.':'No suggestions match your search.'):'No suggestions match the selected filters.'}{page.hasMore?' Try the next page.':''}</p>}<div className="ticket-pagination"><button className="secondary" disabled={!previous.length||busy||!ready||loading} onClick={()=>{setCursor(previous.at(-1)!);setPrevious(previous.slice(0,-1));}}>Previous</button><button className="secondary" disabled={!page.hasMore||!page.meta.cursor||busy||!ready||loading} onClick={()=>{setPrevious([...previous,cursor]);setCursor(page.meta.cursor!);}}>Next</button></div>
+  {selected&&<div className="suggestion-detail"><div className="suggestion-controls"><div><h3>Forum tags</h3><p className="muted">Apply up to five existing tags.</p><div className="suggestion-tag-options">{page.meta.tags.map(t=><label className="checkbox" key={t.id}><input type="checkbox" checked={tags.includes(t.id)} disabled={busy||!has(session,'suggestions.tags')||selected.archived||selected.locked||tags.length>=5&&!tags.includes(t.id)} onChange={e=>setTags(e.target.checked?[...tags,t.id]:tags.filter(id=>id!==t.id))}/>{t.name}</label>)}</div>{(selected.archived||selected.locked)&&<p className="muted">Tag editing is available for active, unlocked threads.</p>}{has(session,'suggestions.tags')&&<button className="primary" disabled={busy||selected.archived||selected.locked} onClick={async()=>{setBusy(true);setError('');try{const result=await api<{messages:Thread[]}>('/suggestions/'+selected.id+'/tags',{tags,expected:selected.tagIds});const updated=result.messages[0]!;cache.current.clear();setSelected(updated);setTags(updated.tagIds);setPage({...page,threads:page.threads.map(t=>t.id===updated.id?updated:t)});setNotice('Forum tags updated.');}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>Save tags</button>}</div>
++ {(has(session,'suggestions.status')||has(session,'suggestions.delete'))&&<div className="suggestion-admin"><h3>Status</h3><p className="muted">Shown on the Discord post, which the bot edits through the webhook.</p>{has(session,'suggestions.status')&&<><select aria-label="Suggestion status" value={status} disabled={busy||selected.archived||selected.locked} onChange={e=>setStatus(e.target.value)}><option value="" disabled>Choose a status…</option>{SUGGESTION_STATUSES.map(v=><option key={v} value={v}>{v}</option>)}</select><button className="primary" disabled={busy||!status||status===(selected.status??'')||selected.archived||selected.locked} onClick={async()=>{setBusy(true);setError('');try{const result=await api<{messages:Thread[]}>('/suggestions/'+selected.id+'/status',{status,expected:selected.status});const updated=result.messages[0]!;cache.current.clear();setSelected(updated);setStatus(updated.status??'');setPage({...page,threads:page.threads.map(t=>t.id===updated.id?updated:t)});setNotice('Status updated and Discord message edited.');}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>Save status</button></>}{has(session,'suggestions.delete')&&<button className="danger" disabled={busy} onClick={async()=>{if(!window.confirm('Delete “'+selected.name+'” and its whole Discord thread? This cannot be undone.'))return;setBusy(true);setError('');try{await api('/suggestions/'+selected.id+'/delete',{});cache.current.clear();setSelected(null);setPage({...page,threads:page.threads.filter(t=>t.id!==selected.id)});after.current='Suggestion deleted.';setRefresh(v=>v+1);}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>Delete suggestion</button>}</div>}
+  {has(session,'tab.todo')&&has(session,'todo.create')&&<div><h3>Make it happen</h3><p className="muted">Add this idea to the developer board.</p><button className="secondary" disabled={busy} onClick={async()=>{setBusy(true);setError('');try{await api('/todos',{title:selected.name,description:'Created from a Discord suggestion.',status:'todo',priority:'normal',assignee:'',source:{id:selected.id,guildId:selected.guildId}});setNotice('Task created. Open To-do to assign and track it.');}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>Create task</button></div>}</div>
+  <TicketConversation key={selected.id} ticket={{...selected,tags:names(selected.tagIds)}} api={api} apiBase="/suggestions" canReply={has(session,'suggestions.reply')&&!selected.archived&&!selected.locked} onBack={()=>setSelected(null)} readOnlyMessage={selected.archived||selected.locked?'This thread is archived or locked. Reopen it in Discord to reply.':'Your rank needs “Reply to suggestions” to respond.'}/>
+  </div>}
+diff --git a/web-server/client/style.css b/web-server/client/style.css
+index c55ada7..e976d7f 100644
+--- a/web-server/client/style.css
++++ b/web-server/client/style.css
+@@ -44,3 +44,7 @@
+ .todo-task[draggable=true]{cursor:grab}.todo-task.dragging{opacity:.4}.todo-column.drop-target{border-color:var(--accent);background:rgba(201,239,131,.08);box-shadow:inset 0 0 0 1px var(--accent)}.task-move{font-size:11px;padding:5px 7px;max-width:130px}.todo-column{min-height:220px;transition:border-color .15s,background .15s}
+ #suggestions .section-header{padding:12px 16px}#suggestions .section-header h2{font-size:15px}#suggestions .section-header p{font-size:11px}#suggestions>.filter-tabs{padding:0 16px;gap:16px}#suggestions>.filter-tabs button{font-size:12px}.suggestion-filters{padding:12px 16px;border-bottom:1px solid var(--line);display:grid;gap:10px}.suggestion-filters>input{max-width:340px;font-size:12px;padding:8px 10px}.suggestion-filter-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px}.suggestion-filter-tags>span{font-size:11px;color:var(--muted);margin-right:5px}.suggestion-filter-tags button{font-size:11px;padding:4px 9px;border:1px solid var(--line);border-radius:20px;background:var(--bg);color:var(--muted)}.suggestion-filter-tags button.selected{background:rgba(201,239,131,.1);border-color:#7b9256;color:var(--accent)}.suggestion-filter-tags .clear-tags{border:0;text-decoration:underline}.suggestion-grid{display:flex;flex-direction:column;gap:0;padding:0 16px}.suggestion-card{display:grid;grid-template-columns:16px minmax(0,1fr) minmax(110px,35%);align-items:center;gap:10px;padding:10px 8px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent}.suggestion-card:hover{background:var(--panel2)}.suggestion-card.selected{box-shadow:inset 2px 0 var(--accent)}.suggestion-row-mark{color:var(--muted);font-size:13px}.suggestion-card strong{font-size:12px;font-weight:600;margin:0;line-height:1.5}.suggestion-card .ticket-tags{justify-content:flex-end;gap:4px}.suggestion-card .ticket-tags span{font-size:10px;padding:2px 6px}.suggestion-controls{padding:14px 16px;gap:16px}.suggestion-controls h3{font-size:12px;margin-bottom:5px}.suggestion-controls p{font-size:11px}.suggestion-tag-options{gap:6px;margin-bottom:10px}.suggestion-tag-options label{font-size:11px;padding:4px 7px}.suggestion-controls button{font-size:11px;padding:7px 10px}#suggestions .ticket-pagination{padding:10px 16px}#suggestions .ticket-pagination button{font-size:11px;padding:6px 10px}
+ @media(max-width:600px){.suggestion-card{grid-template-columns:14px minmax(0,1fr)}.suggestion-card .ticket-tags{grid-column:2;justify-content:flex-start}.suggestion-filters>input{max-width:none;width:100%}}
++#suggestions .board-actions .primary{width:auto;margin-top:0}
++.suggestion-composer{display:grid;gap:10px;padding:16px;border-bottom:1px solid var(--line)}.suggestion-composer h3{margin:0}.suggestion-composer p{margin:0}.suggestion-composer input{width:100%;font-size:13px;padding:9px 10px}.suggestion-composer .primary{width:auto;justify-self:start;margin-top:0}
++.suggestion-admin{display:grid;gap:10px;align-content:start}.suggestion-admin h3,.suggestion-admin p{margin:0}.suggestion-admin select{width:100%;font-size:12px;padding:8px 10px;background:#11191d;color:var(--text);border:1px solid #34424b;border-radius:6px}.suggestion-admin .primary,.suggestion-admin .danger{width:auto;justify-self:start;margin-top:0}
++.suggestion-status{border:1px solid var(--line);color:var(--muted)}.suggestion-status.status-done{color:var(--green);border-color:#3f6a57}.suggestion-status.status-denied{color:var(--red);border-color:#573638}.suggestion-status.status-testing,.suggestion-status.status-poll,.suggestion-status.status-under-consideration{color:var(--accent);border-color:#7b9256}.suggestion-status.status-none{opacity:.6}
+diff --git a/web-server/src/app.ts b/web-server/src/app.ts
+index aed9ceb..df9a77c 100644
+--- a/web-server/src/app.ts
++++ b/web-server/src/app.ts
+@@ -14,6 +14,7 @@ import { Live } from './live.js';
+ import { Images, validItem } from './images.js';
+ import { Failure, equal, object, text, uuid } from './common.js';
+ 
++import { SUGGESTION_STATUSES } from './suggestion-statuses.js';
+ import { has, mutationPermission, filterDetail, filterPlayers } from './permissions.js';
+ const requirePermission=(user:{permissions?:string[]},p:string)=>{if(!has(user,p))throw new Failure(403,'Permission required: '+p);};
+ declare module 'fastify' { interface FastifyRequest { panelSession?:Session } }
+@@ -96,6 +97,38 @@ export async function createApp(config:Config, options:{bridge?:Bridge;fetcher?:
+     try{const result=await ticketBridge.request({action:'suggestions-tags',channel:req.params.id,tags:b.tags,expected:b.expected,actor:user.name});await audit.write(user.name,'suggestion-tags',req.params.id,'success',{tags:b.tags});return result;}
+     catch(error){await audit.write(user.name,'suggestion-tags',req.params.id,'failed-or-unconfirmed',{});throw error;}
+   });
++  const claimRequest=(req:FastifyRequest,prefix:string)=>{
++    const requestId=req.headers['x-request-id'];
++    if(typeof requestId!=='string'||! /^[a-f0-9-]{36}$/.test(requestId))throw new Failure(400,'Request ID required');
++    for(const [key,expiry] of requests)if(expiry<=Date.now())requests.delete(key);
++    const key=prefix+':'+req.cookies.panel_session+':'+requestId;
++    if(requests.has(key))throw new Failure(409,'This request was already submitted. Refresh suggestions before retrying.');
++    if(requests.size>=10000)throw new Failure(503,'Request capacity reached');requests.set(key,req.panelSession!.expires);
++    return requestId;
++  };
++  const SNOWFLAKE=/^[1-9][0-9]{16,19}$/;
++  app.post('/api/suggestions',async req=>{
++    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.create');
++    const b=object(req.body),title=text(b.title,100,'Title'),content=text(b.content,1700,'Suggestion'),requestId=claimRequest(req,'suggestion-create');
++    await audit.write(user.name,'suggestion-create','','requested',{requestId,title});
++    try{const result=await ticketBridge.request({action:'suggestions-create',title,content,actor:user.name,rank:user.rank}) as {messages:{id?:string}[]};await audit.write(user.name,'suggestion-create',result.messages[0]?.id??'','success',{requestId,title});return result;}
++    catch(error){await audit.write(user.name,'suggestion-create','','failed-or-unconfirmed',{requestId,title});throw error;}
++  });
++  app.post<{Params:{id:string}}>('/api/suggestions/:id/status',async req=>{
++    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.status');
++    const b=object(req.body),status=SUGGESTION_STATUSES.find(s=>s===b.status),known=(v:unknown)=>v===undefined||v===null||SUGGESTION_STATUSES.some(s=>s===v);
++    if(!SNOWFLAKE.test(req.params.id)||!status||!known(b.expected))throw new Failure(400,'Choose one of the listed statuses');
++    await audit.write(user.name,'suggestion-status',req.params.id,'requested',{status});
++    try{const result=await ticketBridge.request({action:'suggestions-status',channel:req.params.id,status,expected:b.expected,actor:user.name,rank:user.rank});await audit.write(user.name,'suggestion-status',req.params.id,'success',{status});return result;}
++    catch(error){await audit.write(user.name,'suggestion-status',req.params.id,'failed-or-unconfirmed',{status});throw error;}
++  });
++  app.post<{Params:{id:string}}>('/api/suggestions/:id/delete',async req=>{
++    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.delete');
++    if(!SNOWFLAKE.test(req.params.id))throw new Failure(400,'Invalid thread ID');
++    await audit.write(user.name,'suggestion-delete',req.params.id,'requested',{});
++    try{const result=await ticketBridge.request({action:'suggestions-delete',channel:req.params.id,actor:user.name,rank:user.rank});await audit.write(user.name,'suggestion-delete',req.params.id,'success',{});return result;}
++    catch(error){await audit.write(user.name,'suggestion-delete',req.params.id,'failed-or-unconfirmed',{});throw error;}
++  });
+   app.get('/tickets-commands',{websocket:true},socket=>ticketBridge.attach(socket));
+   app.get<{Params:{id:string};Querystring:{before?:string}}>('/api/tickets/:id/messages',async req=>{
+     const ticket=tickets.authorize(req.panelSession!.user,req.params.id),before=req.query.before;
+diff --git a/web-server/src/permissions.ts b/web-server/src/permissions.ts
+index 447892d..4013cb5 100644
+--- a/web-server/src/permissions.ts
++++ b/web-server/src/permissions.ts
+@@ -1,5 +1,5 @@
+ // Shared with the React client. Authorization never derives from a rank name.
+-export const PERMISSIONS = ['suggestions.reply', 'tab.todo', 'todo.create', 'todo.edit', 'todo.delete', 'tab.suggestions', 'suggestions.tags', 'tickets.reply', 'tab.tickets', 'tickets.lost-items-or-airship', 'tickets.other-support', 'tickets.cant-connect-to-the-server', 'tickets.buy-a-shop-plot-at-spawn', 'tickets.stealing-or-grieffing', 'tickets.player-report', 'tickets.report', 'tickets.uncategorized', 'panel.access', 'tab.players', 'tab.overview', 'tab.cases', 'tab.notes', 'tab.security', 'tab.inventory', 'tab.enderChest', 'tab.curios', 'tab.audit', 'access.manage', 'notes.add', 'notes.edit', 'notes.remove', 'punish.warn', 'punish.kick', 'punish.mute', 'punish.ban', 'punish.offense', 'punish.remove', 'punish.revoke'] as const;
++export const PERMISSIONS = ['suggestions.reply', 'tab.todo', 'todo.create', 'todo.edit', 'todo.delete', 'tab.suggestions', 'suggestions.tags', 'suggestions.status', 'suggestions.create', 'suggestions.delete', 'tickets.reply', 'tab.tickets', 'tickets.lost-items-or-airship', 'tickets.other-support', 'tickets.cant-connect-to-the-server', 'tickets.buy-a-shop-plot-at-spawn', 'tickets.stealing-or-grieffing', 'tickets.player-report', 'tickets.report', 'tickets.uncategorized', 'panel.access', 'tab.players', 'tab.overview', 'tab.cases', 'tab.notes', 'tab.security', 'tab.inventory', 'tab.enderChest', 'tab.curios', 'tab.audit', 'access.manage', 'notes.add', 'notes.edit', 'notes.remove', 'punish.warn', 'punish.kick', 'punish.mute', 'punish.ban', 'punish.offense', 'punish.remove', 'punish.revoke'] as const;
+ export type Permission = typeof PERMISSIONS[number];
+ export const has = (user:{permissions?:readonly string[]}|null|undefined, permission:string) => !!user?.permissions?.includes(permission);
+ export function legacyPermissions(role:string, rank=role):string[] {
+@@ -36,6 +36,9 @@ export const PERMISSION_LABELS:Record<Permission,string>={
+  'todo.delete':'Delete tasks',
+  'tab.suggestions':'Suggestions tab',
+  'suggestions.tags':'Apply and remove suggestion tags',
++ 'suggestions.status':'Change suggestion status',
++ 'suggestions.create':'Add suggestions',
++ 'suggestions.delete':'Delete suggestions',
+  'tickets.reply':'Reply to permitted tickets',
+  'tab.tickets':'Tickets tab',
+  'tickets.lost-items-or-airship':"Lost Items or Airship tickets",
+diff --git a/web-server/src/suggestion-statuses.ts b/web-server/src/suggestion-statuses.ts
+new file mode 100644
+index 0000000..128e16c
+--- /dev/null
++++ b/web-server/src/suggestion-statuses.ts
+@@ -0,0 +1,3 @@
++// Shared with the React client. Keep in sync with discord-bot/src/suggestions.ts (a test checks this).
++export const SUGGESTION_STATUSES = ['Denied', 'Done', 'Under consideration', 'Maybe next season', 'Waiting for update', 'Testing', 'Poll'] as const;
++export type SuggestionStatus = typeof SUGGESTION_STATUSES[number];
+diff --git a/web-server/src/ticket-bridge.ts b/web-server/src/ticket-bridge.ts
+index 2e3d335..e8aae37 100644
+--- a/web-server/src/ticket-bridge.ts
++++ b/web-server/src/ticket-bridge.ts
+@@ -15,7 +15,7 @@ export class TicketBridge {
+     if(m.type!=='done')throw new Error();
+     clearTimeout(p.timer);this.pending.delete(m.id);
+     if(m.error){
+-     const errors:Record<string,[number,string]>={'suggestions-unconfigured':[503,'Set SUGGESTIONS_FORUM_ID in the Discord bot .env and restart it.'],'suggestions-conflict':[409,'Suggestion tags changed. Refresh suggestions before saving again.'],'suggestions-readonly':[403,'Tag editing requires an active, unlocked thread and Manage Threads permission for the bot.']};
++     const errors:Record<string,[number,string]>={'suggestions-unconfigured':[503,'Set SUGGESTIONS_FORUM_ID in the Discord bot .env and restart it.'],'suggestions-conflict':[409,'This suggestion changed on Discord. Refresh suggestions before saving again.'],'suggestions-readonly':[403,'Editing requires an active, unlocked thread, and the bot needs the Manage Threads permission.'],'suggestions-webhook-unconfigured':[503,'Set SUGGESTIONS_WEBHOOK_URL in the Discord bot .env and restart it.'],'suggestions-webhook-mismatch':[503,'SUGGESTIONS_WEBHOOK_URL must be a webhook of the suggestions forum channel.'],'suggestions-status-unsupported':[409,'This suggestion was not posted by the configured webhook, so its message cannot be edited.'],'suggestions-too-long':[400,'The suggestion text is too long to add a status line.']};
+      const [status,message]=errors[String(m.errorCode)]??[502,'Discord request failed. Check bot permissions and refresh before retrying.'];p.reject(new Failure(status,message));
+     }
+     else p.resolve({messages:p.rows,hasMore:m.hasMore===true});
+diff --git a/web-server/test/suggestions.test.ts b/web-server/test/suggestions.test.ts
+index ea8db8d..26d0af0 100644
+--- a/web-server/test/suggestions.test.ts
++++ b/web-server/test/suggestions.test.ts
+@@ -40,3 +40,42 @@ test('suggestion replies require their own grant, CSRF and unique request ID and
+   account.permissions=['panel.access','suggestions.reply'];staff=await login(f);assert.equal((await post(randomUUID())).statusCode,403);
+  }finally{bot?.terminate();await f.close();}
+ });
++
++test('admin suggestion status, create and delete need their own grants, valid statuses and are audited',async()=>{
++ const {randomUUID}=await import('node:crypto');const {readFile}=await import('node:fs/promises');const f=await fixture();let bot:WebSocket|undefined;
++ try{
++  f.config.ticketSyncToken='a'.repeat(43);bot=new WebSocket(f.url.replace('http','ws')+'/tickets-commands',{headers:{Authorization:'Bearer '+f.config.ticketSyncToken}});await once(bot,'open');
++  const commands:any[]=[];bot.on('message',data=>{const c=JSON.parse(data.toString());commands.push(c);bot!.send(JSON.stringify({type:'item',id:c.id,message:{id:'12345678901234567',name:'Spawn station',status:c.status??null}}));bot!.send(JSON.stringify({type:'done',id:c.id}));});
++  const account=f.config.users.get('admin')!;account.permissions=['panel.access','tab.suggestions'];let staff=await login(f);
++  const id='12345678901234567';
++  const status=(value:unknown,expected:unknown=null)=>f.app.inject({method:'POST',url:`/api/suggestions/${id}/status`,headers:headers(f,staff),payload:{status:value,expected}});
++  const create=(payload:unknown,rid=randomUUID())=>f.app.inject({method:'POST',url:'/api/suggestions',headers:{...headers(f,staff),'x-request-id':rid},payload:payload as object});
++  const remove=()=>f.app.inject({method:'POST',url:`/api/suggestions/${id}/delete`,headers:headers(f,staff),payload:{}});
++  assert.equal((await status('Done')).statusCode,403);assert.equal((await create({title:'T',content:'C'})).statusCode,403);assert.equal((await remove()).statusCode,403);assert.equal(commands.length,0);
++
++  account.permissions.push('suggestions.status');staff=await login(f);
++  for(const bad of ['Invented','done','',null,7])assert.equal((await status(bad)).statusCode,400);
++  assert.equal((await status('Done','Invented')).statusCode,400);assert.equal(commands.length,0);
++  for(const value of ['Denied','Done','Under consideration','Maybe next season','Waiting for update','Testing','Poll'])assert.equal((await status(value,'Testing')).statusCode,200);
++  assert.deepEqual({action:commands.at(-1).action,status:commands.at(-1).status,expected:commands.at(-1).expected,actor:commands.at(-1).actor,rank:commands.at(-1).rank,channel:commands.at(-1).channel},{action:'suggestions-status',status:'Poll',expected:'Testing',actor:'admin',rank:'admin',channel:id});
++  assert(f.audit.recent().some(r=>r.action==='suggestion-status'&&r.state==='success'));
++  assert.equal((await status('Done')).statusCode,200);
++
++  account.permissions.push('suggestions.create');staff=await login(f);
++  assert.equal((await create({title:'',content:'C'})).statusCode,400);assert.equal((await create({title:'T'.repeat(101),content:'C'})).statusCode,400);assert.equal((await create({title:'T',content:'C'.repeat(1701)})).statusCode,400);
++  assert.equal((await f.app.inject({method:'POST',url:'/api/suggestions',headers:headers(f,staff),payload:{title:'T',content:'C'}})).statusCode,400);
++  const rid=randomUUID(),before=commands.length;assert.equal((await create({title:'Spawn station',content:'Please add one'},rid)).statusCode,200);assert.equal((await create({title:'Spawn station',content:'Please add one'},rid)).statusCode,409);
++  assert.equal(commands.length,before+1);assert.deepEqual({action:commands.at(-1).action,title:commands.at(-1).title,content:commands.at(-1).content,rank:commands.at(-1).rank},{action:'suggestions-create',title:'Spawn station',content:'Please add one',rank:'admin'});
++  assert(f.audit.recent().some(r=>r.action==='suggestion-create'&&r.state==='success'));
++
++  const count=commands.length;assert.equal((await remove()).statusCode,403);assert.equal(commands.length,count);
++  account.permissions.push('suggestions.delete');staff=await login(f);
++  assert.equal((await f.app.inject({method:'POST',url:'/api/suggestions/not-an-id/delete',headers:headers(f,staff),payload:{}})).statusCode,400);
++  assert.equal((await remove()).statusCode,200);assert.equal(commands.at(-1).action,'suggestions-delete');assert.equal(commands.at(-1).channel,id);
++  assert(f.audit.recent().some(r=>r.action==='suggestion-delete'&&r.state==='success'));
++
++  const bot_source=await readFile('../discord-bot/src/suggestions.ts','utf8'),{SUGGESTION_STATUSES}=await import('../src/suggestion-statuses.js');
++  const listed=[...bot_source.match(/SUGGESTION_STATUSES=\[([^\]]+)\]/)![1]!.matchAll(/'([^']+)'/g)].map(m=>m[1]);
++  assert.deepEqual(listed,[...SUGGESTION_STATUSES],'bot and panel status lists match');
++ }finally{bot?.terminate();await f.close();}
++});

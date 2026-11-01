@@ -1,6 +1,45 @@
-import { ChannelType, PermissionFlagsBits, type Guild, type ThreadChannel, type ForumChannel, type Message } from 'discord.js';
-import type { TicketConfig } from './tickets.js';
+import { ChannelType, PermissionFlagsBits, WebhookClient, type Guild, type ThreadChannel, type ForumChannel, type Message } from 'discord.js';
+import { WEBHOOK_URL, type TicketConfig } from './tickets.js';
+import { staffSignature } from './signature.js';
 export class SuggestionError extends Error {constructor(public code:string){super(code);}}
+export const SUGGESTION_ACTIONS=['suggestions-list','suggestions-tags','suggestions-status','suggestions-create','suggestions-delete'];
+// Keep in sync with web-server/src/suggestion-statuses.ts (a web test checks this).
+export const SUGGESTION_STATUSES=['Denied','Done','Under consideration','Maybe next season','Waiting for update','Testing','Poll'] as const;
+export type SuggestionStatus=typeof SUGGESTION_STATUSES[number];
+// The status lives in the last line of the suggestion's first message, edited through the webhook that posted it.
+const STATUS_LINE=/\n*\*\*Status:\*\* ([^\n]+?)\s*$/;
+export const statusOf=(content:string):SuggestionStatus|null=>{const m=STATUS_LINE.exec(content);return SUGGESTION_STATUSES.find(s=>s===m?.[1])??null;};
+export const withStatus=(content:string,status:SuggestionStatus)=>content.replace(STATUS_LINE,'').trimEnd()+'\n\n**Status:** '+status;
+interface WebhookLike {
+ send(options:{content:string;threadName:string;allowedMentions:{parse:[]}}):Promise<{channel_id:string}>;
+ fetchMessage(id:string,options:{threadId:string}):Promise<{content:string}>;
+ editMessage(id:string,options:{content:string;threadId:string;allowedMentions:{parse:[]}}):Promise<unknown>;
+}
+export interface SuggestionDeps {webhook?:(guild:Guild,forum:ForumChannel,config:TicketConfig)=>Promise<WebhookLike>}
+const verified=new Map<string,WebhookClient>();
+async function defaultWebhook(guild:Guild,forum:ForumChannel,config:TicketConfig):Promise<WebhookLike> {
+ const match=config.suggestionsWebhookUrl?WEBHOOK_URL.exec(config.suggestionsWebhookUrl):null;
+ if(!match)throw new SuggestionError('suggestions-webhook-unconfigured');
+ const cached=verified.get(forum.id);if(cached)return cached as unknown as WebhookLike;
+ // Refuse a webhook that belongs to some other channel before any message is sent through it.
+ const info=await guild.client.fetchWebhook(match[1]!,match[2]!);
+ if(info.channelId!==forum.id||info.guildId!==guild.id)throw new SuggestionError('suggestions-webhook-mismatch');
+ const client=new WebhookClient({id:match[1]!,token:match[2]!});verified.set(forum.id,client);
+ return client as unknown as WebhookLike;
+}
+const statuses=new Map<string,SuggestionStatus|null>();
+export const invalidateSuggestionStatus=(id:string)=>{statuses.delete(id);};
+async function loadStatuses(threads:ThreadChannel[]) {
+ const missing=threads.filter(t=>!statuses.has(t.id));let next=0;
+ await Promise.all(Array.from({length:Math.min(6,missing.length)},async()=>{
+  while(next<missing.length){
+   const t=missing[next++]!;
+   try{statuses.set(t.id,statusOf((await t.fetchStarterMessage({cache:false}))?.content??''));}
+   catch{/* Starter message deleted or unreadable: show no status and retry on the next list. */}
+  }
+ }));
+ if(statuses.size>5000)for(const key of [...statuses.keys()].slice(0,1000))statuses.delete(key);
+}
 const snowflake=(v:unknown):v is string=>typeof v==='string'&&/^[1-9][0-9]{16,19}$/.test(v);
 export async function suggestionForum(guild:Guild,config:TicketConfig) {
  if(!config.suggestionsForumId)throw new SuggestionError('suggestions-unconfigured');
@@ -19,7 +58,7 @@ export async function suggestionThread(guild:Guild,config:TicketConfig,id:unknow
 export const activityId=(t:Pick<ThreadChannel,'id'|'lastMessageId'>)=>BigInt(t.lastMessageId??t.id);
 export const newestActivity=(a:Pick<ThreadChannel,'id'|'lastMessageId'>,b:Pick<ThreadChannel,'id'|'lastMessageId'>)=>activityId(a)>activityId(b)?-1:activityId(a)<activityId(b)?1:BigInt(a.id)>BigInt(b.id)?-1:BigInt(a.id)<BigInt(b.id)?1:0;
 const archives=new WeakMap<Guild,Map<string,{expires:number;threads:ThreadChannel[]}>>();
-const row=(t:ThreadChannel)=>({id:t.id,name:t.name,guildId:t.guild.id,tagIds:t.appliedTags,archived:!!t.archived,locked:!!t.locked,createdAt:t.createdTimestamp,lastMessageAt:Number(activityId(t)>>22n)+1420070400000});
+const row=(t:ThreadChannel)=>({status:statuses.get(t.id)??null,id:t.id,name:t.name,guildId:t.guild.id,tagIds:t.appliedTags,archived:!!t.archived,locked:!!t.locked,createdAt:t.createdTimestamp,lastMessageAt:Number(activityId(t)>>22n)+1420070400000});
 const editing=new Set<string>();
 // A bounded, in-memory index. Startup indexing is asynchronous, not on the search path.
 interface IndexedThread {thread:ThreadChannel;messages:Map<string,string>}
@@ -117,7 +156,7 @@ export async function buildSuggestionIndex(guild:Guild,config:TicketConfig) {
  }finally{idx.loading=false;}
 }
 
-export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>):Promise<{messages:unknown[];hasMore:boolean}> {
+export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps={}):Promise<{messages:unknown[];hasMore:boolean}> {
  if(c.action==='suggestions-list'){
   if(c.query!==undefined&&(typeof c.query!=='string'||c.query.length>160))throw new Error('Invalid search query');
   const needle=typeof c.query==='string'?c.query.trim().toLocaleLowerCase():'';
@@ -142,9 +181,13 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
   }
   all.sort(newestActivity);
   threads=all.slice(offset,offset+24);hasMore=offset+24<all.length;cursor=String(offset+24);
+  await loadStatuses(threads);
 
   return {messages:[{forumId:forum.id,name:forum.name,guildId:guild.id,tags:forum.availableTags.map(t=>({id:t.id,name:t.name,moderated:t.moderated})),cursor,indexing:needle?indexFor(guild).loading:false,indexed:needle?indexFor(guild).indexed:undefined,total:needle?indexFor(guild).total:undefined},...threads.map(row)],hasMore};
  }
+ if(c.action==='suggestions-create')return createSuggestion(guild,config,c,deps);
+ if(c.action==='suggestions-status')return changeStatus(guild,config,c,deps);
+ if(c.action==='suggestions-delete')return deleteSuggestion(guild,config,c);
  if(c.action!=='suggestions-tags')throw new Error('Unknown suggestion command');
  if(!snowflake(c.channel)||editing.has(c.channel))throw new Error('Tag edit in progress');
  editing.add(c.channel);
@@ -158,5 +201,56 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
   const updated=await thread.setAppliedTags(c.tags,'Admin panel suggestion tags');
   const existing=indexFor(guild).threads.get(updated.id);if(existing)existing.thread=updated;
   return {messages:[row(updated)],hasMore:false};
+ }finally{editing.delete(c.channel);}
+}
+
+const staff=(c:Record<string,unknown>)=>{
+ if(typeof c.actor!=='string'||!c.actor||c.actor.length>130||typeof c.rank!=='string'||!c.rank.trim()||c.rank.length>32)throw new Error('Invalid staff identity');
+ return {actor:c.actor,rank:c.rank};
+};
+async function createSuggestion(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps) {
+ if(typeof c.title!=='string'||!c.title.trim()||c.title.trim().length>100||typeof c.content!=='string'||!c.content.trim()||c.content.length>1700)throw new Error('Invalid suggestion');
+ const {actor,rank}=staff(c),forum=await suggestionForum(guild,config);
+ const hook=await (deps.webhook??defaultWebhook)(guild,forum,config);
+ const content=`${c.content.trim()}\n\n${await staffSignature(guild,actor,rank)}`;
+ const sent=await hook.send({content,threadName:c.title.trim(),allowedMentions:{parse:[]}});
+ const {thread}=await suggestionThread(guild,config,sent.channel_id);
+ statuses.set(thread.id,null);
+ return {messages:[row(thread)],hasMore:false};
+}
+async function changeStatus(guild:Guild,config:TicketConfig,c:Record<string,unknown>,deps:SuggestionDeps) {
+ const status=SUGGESTION_STATUSES.find(s=>s===c.status);
+ if(!snowflake(c.channel)||!status||c.expected!==undefined&&c.expected!==null&&!SUGGESTION_STATUSES.some(s=>s===c.expected))throw new Error('Invalid suggestion status');
+ staff(c);
+ if(editing.has(c.channel))throw new Error('Suggestion edit in progress');
+ editing.add(c.channel);
+ try{
+  const {forum,thread}=await suggestionThread(guild,config,c.channel);
+  if(thread.archived||thread.locked)throw new SuggestionError('suggestions-readonly');
+  const hook=await (deps.webhook??defaultWebhook)(guild,forum,config);
+  // The first post of a forum thread has the thread's ID. The webhook can only read and edit its own messages.
+  let current:{content:string};
+  try{current=await hook.fetchMessage(thread.id,{threadId:thread.id});}
+  catch{throw new SuggestionError('suggestions-status-unsupported');}
+  if(c.expected!==undefined&&statusOf(current.content)!==c.expected)throw new SuggestionError('suggestions-conflict');
+  const content=withStatus(current.content,status);
+  if(content.length>2000)throw new SuggestionError('suggestions-too-long');
+  await hook.editMessage(thread.id,{content,threadId:thread.id,allowedMentions:{parse:[]}});
+  statuses.set(thread.id,status);
+  return {messages:[row(thread)],hasMore:false};
+ }finally{editing.delete(c.channel);}
+}
+async function deleteSuggestion(guild:Guild,config:TicketConfig,c:Record<string,unknown>) {
+ if(!snowflake(c.channel))throw new Error('Invalid thread');
+ const {actor}=staff(c);
+ if(editing.has(c.channel))throw new Error('Suggestion edit in progress');
+ editing.add(c.channel);
+ try{
+  const {thread}=await suggestionThread(guild,config,c.channel);
+  const me=await guild.members.fetchMe();
+  if(!thread.permissionsFor(me)?.has(PermissionFlagsBits.ManageThreads))throw new SuggestionError('suggestions-readonly');
+  await thread.delete('Admin panel: suggestion removed by '+actor.replace(/[\r\n]/g,' ').slice(0,100));
+  removeSuggestionThread(guild,thread.id);statuses.delete(thread.id);
+  return {messages:[],hasMore:false};
  }finally{editing.delete(c.channel);}
 }

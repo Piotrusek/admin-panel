@@ -5,10 +5,15 @@ export const TICKET_CATEGORIES = [{"id": "lost-items-or-airship", "label": "Lost
 export const UNCATEGORIZED_TICKET = {id:'uncategorized',label:'Uncategorized'} as const;
 
 export interface Ticket { id:string; name:string; category:string; guildId:string; tags:string[] }
-export interface TicketConfig { suggestionsForumId?:string; categoryIds:string[]; rules:{id:string;label:string;pattern:string}[]; url?:string; token?:string }
+export interface TicketConfig { suggestionsForumId?:string; suggestionsWebhookUrl?:string; categoryIds:string[]; rules:{id:string;label:string;pattern:string}[]; url?:string; token?:string }
+// A Discord webhook URL; the token is a secret and is never included in error messages.
+export const WEBHOOK_URL=/^https:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/api(?:\/v[0-9]+)?\/webhooks\/([0-9]{17,20})\/([A-Za-z0-9_-]{20,100})$/;
 export function ticketConfig(env:NodeJS.ProcessEnv=process.env):TicketConfig {
  const suggestionsForumId=env.SUGGESTIONS_FORUM_ID?.trim()||undefined;
  if(suggestionsForumId&&!/^[1-9][0-9]{16,19}$/.test(suggestionsForumId))throw new Error('Invalid SUGGESTIONS_FORUM_ID');
+ const suggestionsWebhookUrl=env.SUGGESTIONS_WEBHOOK_URL?.trim()||undefined;
+ if(suggestionsWebhookUrl&&!WEBHOOK_URL.test(suggestionsWebhookUrl))throw new Error('Invalid SUGGESTIONS_WEBHOOK_URL');
+ if(suggestionsWebhookUrl&&!suggestionsForumId)throw new Error('Set SUGGESTIONS_FORUM_ID before SUGGESTIONS_WEBHOOK_URL');
  const categoryIds=(env.TICKET_CATEGORY_IDS||'').split(',').map(s=>s.trim()).filter(Boolean);
  if(categoryIds.some(id=>! /^[1-9][0-9]{16,19}$/.test(id)))throw new Error('Invalid TICKET_CATEGORY_IDS');
  let overrides:Record<string, {pattern?:string;label?:string}>={};
@@ -28,7 +33,7 @@ export function ticketConfig(env:NodeJS.ProcessEnv=process.env):TicketConfig {
   if(!token||! /^[A-Za-z0-9_-]{43,128}$/.test(token))throw new Error('Set TICKET_SYNC_TOKEN to a random 43–128 character URL-safe secret');
   if(!categoryIds.length&&!suggestionsForumId)throw new Error('Set TICKET_CATEGORY_IDS before enabling sync');
  }
- return {categoryIds,rules,url,token,suggestionsForumId};
+ return {categoryIds,rules,url,token,suggestionsForumId,...(suggestionsWebhookUrl?{suggestionsWebhookUrl}:{})};
 }
 export function matches(name:string,pattern:string):boolean {
  // Only literal lowercase letters, digits and hyphens plus wildcard * are allowed.

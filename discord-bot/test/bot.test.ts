@@ -253,3 +253,62 @@ test('background suggestion index finds message bodies across pages and follows 
  for(let i=0;i<20&&(await query('hidden hangar')).length;i++)await new Promise(resolve=>setTimeout(resolve,10));
  assert.equal((await query('hidden hangar')).length,0,'deletions remove stale text');
 });
+
+import { statusOf, withStatus, SUGGESTION_STATUSES } from '../src/suggestions.js';
+test('suggestion status is a single trailing line that is replaced, never duplicated',()=>{
+ assert.deepEqual([...SUGGESTION_STATUSES],['Denied','Done','Under consideration','Maybe next season','Waiting for update','Testing','Poll']);
+ assert.equal(statusOf('Add a spawn station'),null);
+ const first=withStatus('Add a spawn station\n\n— Staff · admin','Testing');
+ assert.equal(first,'Add a spawn station\n\n— Staff · admin\n\n**Status:** Testing');assert.equal(statusOf(first),'Testing');
+ const second=withStatus(first,'Under consideration');
+ assert.equal(second,'Add a spawn station\n\n— Staff · admin\n\n**Status:** Under consideration');assert.equal(second.match(/Status/g)!.length,1);
+ assert.equal(statusOf('Status: Done'),null);assert.equal(statusOf('**Status:** Invented'),null);
+});
+
+test('webhook configuration is validated without echoing its token',()=>{
+ const forum='12345678901234567',token='a'.repeat(40),url='https://discord.com/api/webhooks/12345678901234568/'+token;
+ assert.equal(ticketConfig({SUGGESTIONS_FORUM_ID:forum,SUGGESTIONS_WEBHOOK_URL:url}).suggestionsWebhookUrl,url);
+ assert.equal(ticketConfig({SUGGESTIONS_FORUM_ID:forum}).suggestionsWebhookUrl,undefined);
+ for(const bad of ['http://discord.com/api/webhooks/12345678901234568/'+token,'https://example.com/api/webhooks/12345678901234568/'+token,'https://discord.com/api/webhooks/1/'+token]){
+  assert.throws(()=>ticketConfig({SUGGESTIONS_FORUM_ID:forum,SUGGESTIONS_WEBHOOK_URL:bad}),error=>error instanceof Error&&!error.message.includes(token));
+ }
+ assert.throws(()=>ticketConfig({SUGGESTIONS_WEBHOOK_URL:url}),/SUGGESTIONS_FORUM_ID/);
+});
+
+test('admin suggestion commands create via webhook, edit its message status, and delete threads',async()=>{
+ const forumId='12345678901234567',threadId='12345678901234568',other='12345678901234571';
+ const config=ticketConfig({SUGGESTIONS_FORUM_ID:forumId});
+ const thread:any={id:threadId,name:'Build a spawn station',guild:{id:'12345678901234570'},parentId:forumId,viewable:true,isThread:()=>true,appliedTags:[],archived:false,locked:false,createdTimestamp:1,permissionsFor:()=>({has:()=>allowed}),deleted:0,delete:async()=>{thread.deleted++;}};
+ let allowed=true,stored='Build a spawn station\n\n— Staff · admin',sent:any,edited:any,failFetch=false;
+ const forum={id:forumId,name:'Suggestions',type:ChannelType.GuildForum,viewable:true,permissionsFor:()=>({has:()=>true}),availableTags:[]};
+ const guild={id:'12345678901234570',members:{fetchMe:async()=>({}),fetch:async()=>{throw new Error('no member');}},channels:{fetch:async(id:string)=>id===forumId?forum:id===threadId?thread:null}} as unknown as Guild;
+ const deps={webhook:async()=>({
+  send:async(o:any)=>{sent=o;return {channel_id:threadId};},
+  fetchMessage:async(id:string,o:any)=>{assert.equal(id,threadId);assert.equal(o.threadId,threadId);if(failFetch)throw new Error('Unknown Message');return {content:stored};},
+  editMessage:async(id:string,o:any)=>{assert.equal(id,threadId);edited=o;stored=o.content;return {};}
+ })};
+ const staff={actor:'Alex [12345678901234569]',rank:'admin'};
+ const created=await suggestionCommand(guild,config,{action:'suggestions-create',title:' Build a spawn station ',content:'Please add one @everyone',...staff},deps);
+ assert.equal(sent.threadName,'Build a spawn station');assert.deepEqual(sent.allowedMentions,{parse:[]});assert(sent.content.endsWith('\n\n— Alex · admin'));
+ assert.equal((created.messages[0] as any).status,null);
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'',content:'x',...staff},deps),/Invalid suggestion/);
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t'.repeat(101),content:'x',...staff},deps),/Invalid suggestion/);
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t',content:'x'.repeat(1701),...staff},deps),/Invalid suggestion/);
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-create',title:'t',content:'x'},deps),/Invalid staff identity/);
+
+ const changed=await suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Maybe next season',expected:null,...staff},deps);
+ assert.equal(edited.content,'Build a spawn station\n\n— Staff · admin\n\n**Status:** Maybe next season');assert.equal(edited.threadId,threadId);assert.deepEqual(edited.allowedMentions,{parse:[]});
+ assert.equal((changed.messages[0] as any).status,'Maybe next season');
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Done',expected:'Poll',...staff},deps),/suggestions-conflict/);
+ await suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Done',expected:'Maybe next season',...staff},deps);
+ assert.equal(stored.match(/Status/g)!.length,1);assert(stored.endsWith('**Status:** Done'));
+ for(const status of ['Invented','',undefined])await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status,...staff},deps),/Invalid suggestion status/);
+ failFetch=true;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},deps),/suggestions-status-unsupported/);failFetch=false;
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},{}),/suggestions-webhook-unconfigured/);
+ stored='x'.repeat(1990);await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Testing',...staff},deps),/suggestions-too-long/);
+ thread.locked=true;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-status',channel:threadId,status:'Poll',...staff},deps),/suggestions-readonly/);thread.locked=false;
+
+ await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-delete',channel:other,...staff}));
+ allowed=false;await assert.rejects(suggestionCommand(guild,config,{action:'suggestions-delete',channel:threadId,...staff}),/suggestions-readonly/);assert.equal(thread.deleted,0);allowed=true;
+ assert.deepEqual(await suggestionCommand(guild,config,{action:'suggestions-delete',channel:threadId,...staff}),{messages:[],hasMore:false});assert.equal(thread.deleted,1);
+});
