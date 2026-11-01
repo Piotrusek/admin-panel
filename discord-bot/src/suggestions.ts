@@ -24,15 +24,15 @@ const editing=new Set<string>();
 // A bounded, in-memory index. Startup indexing is asynchronous, not on the search path.
 interface IndexedThread {thread:ThreadChannel;messages:Map<string,string>}
 interface SearchIndex {threads:Map<string,IndexedThread>;pending:Set<string>;changes:Map<string,number>;ready:boolean;loading:boolean;indexed:number;total:number}
-const indexes=new WeakMap<Guild,SearchIndex>();
+const indexes=new Map<string,SearchIndex>();
 const normalized=(s:string)=>s.toLocaleLowerCase();
 const messageText=(m:Message)=>normalized([
  m.content,...m.embeds.flatMap(e=>[e.title??'',e.description??'',...e.fields.flatMap(f=>[f.name,f.value])]),
  ...m.attachments.map(a=>a.name)
 ].join(' '));
 function indexFor(guild:Guild):SearchIndex {
- let idx=indexes.get(guild);
- if(!idx){idx={threads:new Map(),pending:new Set(),changes:new Map(),ready:false,loading:false,indexed:0,total:0};indexes.set(guild,idx);}
+ let idx=indexes.get(guild.id);
+ if(!idx){idx={threads:new Map(),pending:new Set(),changes:new Map(),ready:false,loading:false,indexed:0,total:0};indexes.set(guild.id,idx);}
  return idx;
 }
 async function archivedThreads(forum:ForumChannel,guild:Guild) {
@@ -78,7 +78,7 @@ function queueThreadRefresh(idx:SearchIndex,t:ThreadChannel) {
   .finally(()=>idx.pending.delete(t.id));
 }
 export function indexSuggestionMessage(guild:Guild,config:TicketConfig,m:Message) {
- if(m.channel.parentId!==config.suggestionsForumId||!m.channel.isThread())return;
+ if(!m.channel.isThread()||m.channel.parentId!==config.suggestionsForumId)return;
  const idx=indexFor(guild),t=m.channel;
  const entry=idx.threads.get(t.id);
  if(entry&&!idx.pending.has(t.id)){
