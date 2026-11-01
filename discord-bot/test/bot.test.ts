@@ -226,3 +226,30 @@ test('suggestion replies are confined to the configured forum and reject archive
  thread.archived=true;await assert.rejects(conversationCommand(guild,config,command),/closed/);thread.archived=false;
  thread.parentId='12345678901234599';await assert.rejects(conversationCommand(guild,config,command),/Not a suggestion/);assert.equal(sends,1);
 });
+
+import { Collection } from 'discord.js';
+import { buildSuggestionIndex,indexSuggestionMessage,invalidateSuggestionThread } from '../src/suggestions.js';
+
+test('background suggestion index finds message bodies across pages and follows new and edited messages',async()=>{
+ const forumId='12345678901234567',guildId='12345678901234699',threadId='12345678901234568';
+ const config=ticketConfig({SUGGESTIONS_FORUM_ID:forumId});
+ const rows=new Map<string,{id:string;content:string;embeds:unknown[];attachments:Collection<string,unknown>}>();
+ const add=(id:string,content:string)=>{const m={id,content,embeds:[],attachments:new Collection()};rows.set(id,m);return m;};
+ add('12345678901234570','A buried blueprint mentions a hidden hangar');
+ const thread:any={id:threadId,name:'Unrelated title',parentId:forumId,viewable:true,archived:false,locked:false,appliedTags:[],createdTimestamp:1,lastMessageId:'12345678901234570',
+  guild:{id:guildId},messages:{fetch:async()=>new Collection(rows)}};
+ const forum:any={id:forumId,name:'Suggestions',type:ChannelType.GuildForum,viewable:true,permissionsFor:()=>({has:()=>true}),availableTags:[],
+  threads:{fetchActive:async()=>({threads:new Collection([[threadId,thread]])}),fetchArchived:async()=>({threads:new Collection(),hasMore:false})}};
+ const guild={id:guildId,members:{fetchMe:async()=>({})},channels:{fetch:async()=>forum}} as unknown as Guild;
+ await buildSuggestionIndex(guild,config);
+ const query=async(q:string)=>((await suggestionCommand(guild,config,{action:'suggestions-list',query:q})).messages as any[]).slice(1);
+ assert.equal((await query('hidden hangar')).length,1);
+ assert.equal((await query('not in index')).length,0);
+ const m=add('12345678901234571','The reactor needs extra cooling');
+ indexSuggestionMessage(guild,config,{...m,guild,channel:{...thread,isThread:()=>true}} as unknown as Message);
+ assert.equal((await query('extra cooling')).length,1,'new messages update the index immediately');
+ rows.delete('12345678901234570');
+ invalidateSuggestionThread(guild,config,thread);
+ for(let i=0;i<20&&(await query('hidden hangar')).length;i++)await new Promise(resolve=>setTimeout(resolve,10));
+ assert.equal((await query('hidden hangar')).length,0,'deletions remove stale text');
+});
