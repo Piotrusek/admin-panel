@@ -52,39 +52,39 @@ async function archivedThreads(forum:ForumChannel,guild:Guild) {
  return source;
 }
 async function refreshIndexedThread(idx:SearchIndex,t:ThreadChannel) {
- const revision=idx.changes.get(t.id)??0;
- const messages=new Map<string,string>();let before:string|undefined;
+ // Re-run if Discord events arrive during pagination; never overwrite newer data.
  for(;;){
-  const batch=await t.messages.fetch({limit:100,before,cache:false});
-  if(!batch.size)break;
-  for(const m of batch.values())messages.set(m.id,messageText(m));
-  if(batch.size<100)break;
-  before=batch.last()!.id;
+  const revision=idx.changes.get(t.id)??0;
+  const messages=new Map<string,string>();let before:string|undefined;
+  for(;;){
+   const batch=await t.messages.fetch({limit:100,before,cache:false});
+   if(!batch.size)break;
+   for(const m of batch.values())messages.set(m.id,messageText(m));
+   if(batch.size<100)break;
+   before=batch.last()!.id;
+  }
+  if((idx.changes.get(t.id)??0)!==revision)continue;
+  if(!idx.threads.has(t.id))idx.indexed++;
+  idx.threads.set(t.id,{thread:t,messages});
+  return;
  }
- // Never replace newer event updates with an older snapshot.
- if((idx.changes.get(t.id)??0)!==revision){queueThreadRefresh(idx,t);return;}
- idx.threads.set(t.id,{thread:t,messages});
- idx.indexed++;
 }
 function queueThreadRefresh(idx:SearchIndex,t:ThreadChannel) {
  idx.changes.set(t.id,(idx.changes.get(t.id)??0)+1);
  if(idx.pending.has(t.id))return;
  idx.pending.add(t.id);
- void (async()=>{
-  try {
-   // Coalesce bursts and retry transient Discord failures.
-   await refreshIndexedThread(idx,t);
-  }catch(error){console.error('Suggestion search index update:',error);}
-  finally{idx.pending.delete(t.id);}
- })();
+ void refreshIndexedThread(idx,t)
+  .catch(error=>console.error('Suggestion search index update:',error))
+  .finally(()=>idx.pending.delete(t.id));
 }
 export function indexSuggestionMessage(guild:Guild,config:TicketConfig,m:Message) {
  if(m.channel.parentId!==config.suggestionsForumId||!m.channel.isThread())return;
  const idx=indexFor(guild),t=m.channel;
  const entry=idx.threads.get(t.id);
- idx.changes.set(t.id,(idx.changes.get(t.id)??0)+1);
- if(entry){entry.thread=t;entry.messages.set(m.id,messageText(m));}
- else queueThreadRefresh(idx,t);
+ if(entry&&!idx.pending.has(t.id)){
+  idx.changes.set(t.id,(idx.changes.get(t.id)??0)+1);
+  entry.thread=t;entry.messages.set(m.id,messageText(m));
+ }else queueThreadRefresh(idx,t);
 }
 export function invalidateSuggestionThread(guild:Guild,config:TicketConfig,t:ThreadChannel) {
  if(t.parentId!==config.suggestionsForumId)return;
@@ -107,12 +107,12 @@ export async function buildSuggestionIndex(guild:Guild,config:TicketConfig) {
   await Promise.all(Array.from({length:Math.min(3,all.length)},async()=>{
    while(next<all.length){
     const t=all[next++]!;
-    if(idx.threads.has(t.id)){idx.indexed++;continue;}
+    if(idx.threads.has(t.id))continue;
     try{await refreshIndexedThread(idx,t);}
     catch(error){console.error('Suggestion search index:',t.id,error);}
    }
   }));
-  idx.ready=true;
+  idx.ready=idx.threads.size===idx.total;
   console.log(`Suggestion index: ${idx.threads.size}/${idx.total} threads searchable.`);
  }finally{idx.loading=false;}
 }
