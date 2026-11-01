@@ -21,8 +21,31 @@ export const newestActivity=(a:Pick<ThreadChannel,'id'|'lastMessageId'>,b:Pick<T
 const archives=new WeakMap<Guild,Map<string,{expires:number;threads:ThreadChannel[]}>>();
 const row=(t:ThreadChannel)=>({id:t.id,name:t.name,guildId:t.guild.id,tagIds:t.appliedTags,archived:!!t.archived,locked:!!t.locked,createdAt:t.createdTimestamp,lastMessageAt:Number(activityId(t)>>22n)+1420070400000});
 const editing=new Set<string>();
+// Index complete thread histories on demand. Invalidate when the latest message changes.
+const messageTextCache=new Map<string,{activity:string;expires:number;text:string}>();
+async function textMatches(t:ThreadChannel,needle:string):Promise<boolean> {
+ const activity=t.lastMessageId??t.id,stored=messageTextCache.get(t.id);
+ if(stored?.activity===activity&&stored.expires>Date.now())return stored.text.includes(needle);
+ const parts:string[]=[];let before:string|undefined;
+ do {
+  const batch=await t.messages.fetch({limit:100,before,cache:false});
+  if(!batch.size)break;
+  for(const m of batch.values()){
+   parts.push(m.content,...m.embeds.flatMap(e=>[e.title??'',e.description??'',...e.fields.flatMap(f=>[f.name,f.value])]),...m.attachments.map(a=>a.name));
+  }
+  if(batch.size<100)break;
+  before=batch.last()!.id;
+ }while(true);
+ const text=parts.join(' ').toLocaleLowerCase();
+ messageTextCache.set(t.id,{activity,expires:Date.now()+300000,text});
+ if(messageTextCache.size>2000)messageTextCache.delete(messageTextCache.keys().next().value!);
+ return text.includes(needle);
+}
+
 export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>):Promise<{messages:unknown[];hasMore:boolean}> {
  if(c.action==='suggestions-list'){
+  if(c.query!==undefined&&(typeof c.query!=='string'||c.query.length>160))throw new Error('Invalid search query');
+  const needle=typeof c.query==='string'?c.query.trim().toLocaleLowerCase():'';
   if(c.cursor!==undefined&&(typeof c.cursor!=='string'||! /^[0-9]{1,16}$/.test(c.cursor)))throw new Error('Invalid cursor');
   const filters=c.tags??[];if(!Array.isArray(filters)||filters.length>20||!filters.every(snowflake))throw new Error('Invalid tag filters');
   if(c.untagged!==undefined&&typeof c.untagged!=='boolean'||c.untagged===true&&filters.length)throw new Error('Invalid untagged filter');
@@ -31,7 +54,7 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
   const offset=Number(c.cursor??0);
   if(!Number.isSafeInteger(offset)||offset<0||offset>100000)throw new Error('Invalid offset');
   let source:ThreadChannel[];
-  if(c.archived===true){
+  if(c.archived===true||needle){
    let cache=archives.get(guild);if(!cache){cache=new Map();archives.set(guild,cache);}
    const cached=cache.get(forum.id);
    if(cached&&cached.expires>Date.now())source=cached.threads;
@@ -49,7 +72,24 @@ export async function suggestionCommand(guild:Guild,config:TicketConfig,c:Record
     cache.set(forum.id,{expires:Date.now()+30000,threads:source});
    }
   }else source=[...(await forum.threads.fetchActive(false)).threads.values()];
-  const all=source.filter(matches).sort(newestActivity);
+  if(needle){
+   const active=[...(await forum.threads.fetchActive(false)).threads.values()];
+   source=[...new Map([...source,...active].map(t=>[t.id,t])).values()];
+  }
+  let all=source.filter(matches);
+  if(needle){
+   const found:ThreadChannel[]=[];
+   // Limit parallel Discord requests to avoid bursts; include matches in any message.
+   let next=0;
+   await Promise.all(Array.from({length:Math.min(4,all.length)},async()=>{
+    while(next<all.length){
+     const t=all[next++]!;
+     if(t.name.toLocaleLowerCase().includes(needle)||await textMatches(t,needle))found.push(t);
+    }
+   }));
+   all=found;
+  }
+  all.sort(newestActivity);
   threads=all.slice(offset,offset+24);hasMore=offset+24<all.length;cursor=String(offset+24);
 
   return {messages:[{forumId:forum.id,name:forum.name,guildId:guild.id,tags:forum.availableTags.map(t=>({id:t.id,name:t.name,moderated:t.moderated})),cursor},...threads.map(row)],hasMore};
