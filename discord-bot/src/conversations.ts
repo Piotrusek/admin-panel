@@ -1,4 +1,5 @@
-import { suggestionCommand, suggestionThread, SuggestionError } from './suggestions.js';
+import { suggestionCommand, suggestionThread, SuggestionError, SUGGESTION_ACTIONS } from './suggestions.js';
+import { staffSignature } from './signature.js';
 import { authorProfiles, profile } from './profiles.js';
 import { mentionFormatter } from './mentions.js';
 import { WebSocket } from 'ws';
@@ -12,7 +13,7 @@ export async function messageView(m:Message,format:ReturnType<typeof mentionForm
   attachments:[...m.attachments.values()].map(a=>({name:a.name,url:a.url,contentType:a.contentType,size:a.size,width:a.width,height:a.height,spoiler:a.spoiler})),embeds};
 }
 export async function conversationCommand(guild:Guild,config:TicketConfig,c:Record<string,unknown>) {
- if(c.action==='suggestions-list'||c.action==='suggestions-tags')return suggestionCommand(guild,config,c);
+ if(SUGGESTION_ACTIONS.includes(String(c.action)))return suggestionCommand(guild,config,c);
  const suggestion=c.action==='suggestions-history'||c.action==='suggestions-reply';
  if(suggestion){await suggestionThread(guild,config,c.channel);c={...c,action:c.action==='suggestions-reply'?'reply':'history'};}
  if(!['history','reply'].includes(String(c.action))||typeof c.channel!=='string'||! /^[1-9][0-9]{16,19}$/.test(c.channel))throw new Error('Invalid command');
@@ -34,12 +35,8 @@ export async function conversationCommand(guild:Guild,config:TicketConfig,c:Reco
  if(typeof c.content!=='string'||!c.content.trim()||c.content.length>1800||typeof c.actor!=='string'||c.actor.length>130||typeof c.rank!=='string'||!c.rank.trim()||c.rank.length>32||typeof c.requestId!=='string'||! /^[a-f0-9-]{36}$/.test(c.requestId))throw new Error('Invalid reply');
  if(channel.isThread()&&(channel.archived||channel.locked))throw new Error('Thread is closed');
  if(!channel.permissionsFor(me)?.has(channel.isThread()?PermissionFlagsBits.SendMessagesInThreads:PermissionFlagsBits.SendMessages))throw new Error('Send permission required');
- const identity=c.actor.match(/^(.*) \[([0-9]{17,20})\]$/);
- let displayName=identity?.[1]??c.actor;
- if(identity){try{displayName=(await guild.members.fetch(identity[2]!)).displayName;}catch{/* Use the account name without the ID if the member is unavailable. */}}
- const clean=(value:string)=>value.replace(/[\r\n*_`~<>@\\|]/g,'').slice(0,80);
- const actor=clean(displayName),rank=clean(c.rank);
- const message=await channel.send({content:`${c.content}\n\n— ${actor} · ${rank}`,allowedMentions:{parse:[],repliedUser:false},nonce:c.requestId.replaceAll('-','').slice(0,24),enforceNonce:true});
+ const signature=await staffSignature(guild,c.actor,c.rank);
+ const message=await channel.send({content:`${c.content}\n\n${signature}`,allowedMentions:{parse:[],repliedUser:false},nonce:c.requestId.replaceAll('-','').slice(0,24),enforceNonce:true});
  return {messages:[await messageView(message,mentionFormatter(guild),authorProfiles(guild))],hasMore:false};
 }
 export function connectConversations(guild:Guild,config:TicketConfig):()=>void {

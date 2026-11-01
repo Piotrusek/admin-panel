@@ -14,6 +14,7 @@ import { Live } from './live.js';
 import { Images, validItem } from './images.js';
 import { Failure, equal, object, text, uuid } from './common.js';
 
+import { SUGGESTION_STATUSES } from './suggestion-statuses.js';
 import { has, mutationPermission, filterDetail, filterPlayers } from './permissions.js';
 const requirePermission=(user:{permissions?:string[]},p:string)=>{if(!has(user,p))throw new Failure(403,'Permission required: '+p);};
 declare module 'fastify' { interface FastifyRequest { panelSession?:Session } }
@@ -95,6 +96,38 @@ export async function createApp(config:Config, options:{bridge?:Bridge;fetcher?:
     await audit.write(user.name,'suggestion-tags',req.params.id,'requested',{tags:b.tags});
     try{const result=await ticketBridge.request({action:'suggestions-tags',channel:req.params.id,tags:b.tags,expected:b.expected,actor:user.name});await audit.write(user.name,'suggestion-tags',req.params.id,'success',{tags:b.tags});return result;}
     catch(error){await audit.write(user.name,'suggestion-tags',req.params.id,'failed-or-unconfirmed',{});throw error;}
+  });
+  const claimRequest=(req:FastifyRequest,prefix:string)=>{
+    const requestId=req.headers['x-request-id'];
+    if(typeof requestId!=='string'||! /^[a-f0-9-]{36}$/.test(requestId))throw new Failure(400,'Request ID required');
+    for(const [key,expiry] of requests)if(expiry<=Date.now())requests.delete(key);
+    const key=prefix+':'+req.cookies.panel_session+':'+requestId;
+    if(requests.has(key))throw new Failure(409,'This request was already submitted. Refresh suggestions before retrying.');
+    if(requests.size>=10000)throw new Failure(503,'Request capacity reached');requests.set(key,req.panelSession!.expires);
+    return requestId;
+  };
+  const SNOWFLAKE=/^[1-9][0-9]{16,19}$/;
+  app.post('/api/suggestions',async req=>{
+    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.create');
+    const b=object(req.body),title=text(b.title,100,'Title'),content=text(b.content,1700,'Suggestion'),requestId=claimRequest(req,'suggestion-create');
+    await audit.write(user.name,'suggestion-create','','requested',{requestId,title});
+    try{const result=await ticketBridge.request({action:'suggestions-create',title,content,actor:user.name,rank:user.rank}) as {messages:{id?:string}[]};await audit.write(user.name,'suggestion-create',result.messages[0]?.id??'','success',{requestId,title});return result;}
+    catch(error){await audit.write(user.name,'suggestion-create','','failed-or-unconfirmed',{requestId,title});throw error;}
+  });
+  app.post<{Params:{id:string}}>('/api/suggestions/:id/status',async req=>{
+    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.status');
+    const b=object(req.body),status=SUGGESTION_STATUSES.find(s=>s===b.status),known=(v:unknown)=>v===undefined||v===null||SUGGESTION_STATUSES.some(s=>s===v);
+    if(!SNOWFLAKE.test(req.params.id)||!status||!known(b.expected))throw new Failure(400,'Choose one of the listed statuses');
+    await audit.write(user.name,'suggestion-status',req.params.id,'requested',{status});
+    try{const result=await ticketBridge.request({action:'suggestions-status',channel:req.params.id,status,expected:b.expected,actor:user.name,rank:user.rank});await audit.write(user.name,'suggestion-status',req.params.id,'success',{status});return result;}
+    catch(error){await audit.write(user.name,'suggestion-status',req.params.id,'failed-or-unconfirmed',{status});throw error;}
+  });
+  app.post<{Params:{id:string}}>('/api/suggestions/:id/delete',async req=>{
+    const user=req.panelSession!.user;requirePermission(user,'tab.suggestions');requirePermission(user,'suggestions.delete');
+    if(!SNOWFLAKE.test(req.params.id))throw new Failure(400,'Invalid thread ID');
+    await audit.write(user.name,'suggestion-delete',req.params.id,'requested',{});
+    try{const result=await ticketBridge.request({action:'suggestions-delete',channel:req.params.id,actor:user.name,rank:user.rank});await audit.write(user.name,'suggestion-delete',req.params.id,'success',{});return result;}
+    catch(error){await audit.write(user.name,'suggestion-delete',req.params.id,'failed-or-unconfirmed',{});throw error;}
   });
   app.get('/tickets-commands',{websocket:true},socket=>ticketBridge.attach(socket));
   app.get<{Params:{id:string};Querystring:{before?:string}}>('/api/tickets/:id/messages',async req=>{

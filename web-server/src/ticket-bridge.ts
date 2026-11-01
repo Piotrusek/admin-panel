@@ -15,7 +15,7 @@ export class TicketBridge {
     if(m.type!=='done')throw new Error();
     clearTimeout(p.timer);this.pending.delete(m.id);
     if(m.error){
-     const errors:Record<string,[number,string]>={'suggestions-unconfigured':[503,'Set SUGGESTIONS_FORUM_ID in the Discord bot .env and restart it.'],'suggestions-conflict':[409,'Suggestion tags changed. Refresh suggestions before saving again.'],'suggestions-readonly':[403,'Tag editing requires an active, unlocked thread and Manage Threads permission for the bot.']};
+     const errors:Record<string,[number,string]>={'suggestions-unconfigured':[503,'Set SUGGESTIONS_FORUM_ID in the Discord bot .env and restart it.'],'suggestions-conflict':[409,'This suggestion changed on Discord. Refresh suggestions before saving again.'],'suggestions-readonly':[403,'Editing requires an active, unlocked thread, and the bot needs the Manage Threads permission.'],'suggestions-webhook-unconfigured':[503,'Set SUGGESTIONS_WEBHOOK_URL in the Discord bot .env and restart it.'],'suggestions-webhook-mismatch':[503,'SUGGESTIONS_WEBHOOK_URL must be a webhook of the suggestions forum channel.'],'suggestions-status-unsupported':[409,'This suggestion was not posted by the configured webhook, so its message cannot be edited.'],'suggestions-too-long':[400,'The suggestion text is too long to add a status line.']};
      const [status,message]=errors[String(m.errorCode)]??[502,'Discord request failed. Check bot permissions and refresh before retrying.'];p.reject(new Failure(status,message));
     }
     else p.resolve({messages:p.rows,hasMore:m.hasMore===true});

@@ -1,4 +1,4 @@
-import { buildSuggestionIndex, indexSuggestionMessage, invalidateSuggestionThread, removeSuggestionThread } from './suggestions.js';
+import { buildSuggestionIndex, indexSuggestionMessage, invalidateSuggestionThread, removeSuggestionThread, invalidateSuggestionStatus } from './suggestions.js';
 import { errorDetail } from './errors.js';
 import { connectConversations } from './conversations.js';
 import { Client, Events, GatewayIntentBits } from 'discord.js';
@@ -34,6 +34,8 @@ try {
   });
   client.on(Events.MessageCreate,message=>{if(message.guild)indexSuggestionMessage(message.guild,tickets,message);});
   client.on(Events.MessageUpdate,(_old,message)=>{
+    // A forum post's first message shares its thread's ID; its edits may change the displayed status.
+    if(message.channelId===message.id)invalidateSuggestionStatus(message.id);
     if(message.guild&&message.channel.isThread()&&message.channel.parentId===tickets.suggestionsForumId)
       invalidateSuggestionThread(message.guild,tickets,message.channel);
   });
@@ -47,7 +49,7 @@ try {
   });
   client.on(Events.ThreadCreate,thread=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
   client.on(Events.ThreadUpdate,(_old,thread)=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
-  client.on(Events.ThreadDelete,thread=>{if(thread.parentId===tickets.suggestionsForumId)removeSuggestionThread(thread.guild,thread.id);});
+  client.on(Events.ThreadDelete,thread=>{if(thread.parentId===tickets.suggestionsForumId)removeSuggestionThread(thread.guild,thread.id);invalidateSuggestionStatus(thread.id);});
   client.on(Events.Error,error=>report('Discord connection error',error));
   for(const signal of ['SIGINT','SIGTERM'] as const)process.once(signal,()=>{console.log('Stopping Discord bot.');clearInterval(ticketTimer);stopConversations();client?.destroy();});
   await client.login(config.token);

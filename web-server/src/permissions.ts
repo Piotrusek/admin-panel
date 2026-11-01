@@ -1,5 +1,5 @@
 // Shared with the React client. Authorization never derives from a rank name.
-export const PERMISSIONS = ['suggestions.reply', 'tab.todo', 'todo.create', 'todo.edit', 'todo.delete', 'tab.suggestions', 'suggestions.tags', 'tickets.reply', 'tab.tickets', 'tickets.lost-items-or-airship', 'tickets.other-support', 'tickets.cant-connect-to-the-server', 'tickets.buy-a-shop-plot-at-spawn', 'tickets.stealing-or-grieffing', 'tickets.player-report', 'tickets.report', 'tickets.uncategorized', 'panel.access', 'tab.players', 'tab.overview', 'tab.cases', 'tab.notes', 'tab.security', 'tab.inventory', 'tab.enderChest', 'tab.curios', 'tab.audit', 'access.manage', 'notes.add', 'notes.edit', 'notes.remove', 'punish.warn', 'punish.kick', 'punish.mute', 'punish.ban', 'punish.offense', 'punish.remove', 'punish.revoke'] as const;
+export const PERMISSIONS = ['suggestions.reply', 'tab.todo', 'todo.create', 'todo.edit', 'todo.delete', 'tab.suggestions', 'suggestions.tags', 'suggestions.status', 'suggestions.create', 'suggestions.delete', 'tickets.reply', 'tab.tickets', 'tickets.lost-items-or-airship', 'tickets.other-support', 'tickets.cant-connect-to-the-server', 'tickets.buy-a-shop-plot-at-spawn', 'tickets.stealing-or-grieffing', 'tickets.player-report', 'tickets.report', 'tickets.uncategorized', 'panel.access', 'tab.players', 'tab.overview', 'tab.cases', 'tab.notes', 'tab.security', 'tab.inventory', 'tab.enderChest', 'tab.curios', 'tab.audit', 'access.manage', 'notes.add', 'notes.edit', 'notes.remove', 'punish.warn', 'punish.kick', 'punish.mute', 'punish.ban', 'punish.offense', 'punish.remove', 'punish.revoke'] as const;
 export type Permission = typeof PERMISSIONS[number];
 export const has = (user:{permissions?:readonly string[]}|null|undefined, permission:string) => !!user?.permissions?.includes(permission);
 export function legacyPermissions(role:string, rank=role):string[] {
@@ -36,6 +36,9 @@ export const PERMISSION_LABELS:Record<Permission,string>={
  'todo.delete':'Delete tasks',
  'tab.suggestions':'Suggestions tab',
  'suggestions.tags':'Apply and remove suggestion tags',
+ 'suggestions.status':'Change suggestion status',
+ 'suggestions.create':'Add suggestions',
+ 'suggestions.delete':'Delete suggestions',
  'tickets.reply':'Reply to permitted tickets',
  'tab.tickets':'Tickets tab',
  'tickets.lost-items-or-airship':"Lost Items or Airship tickets",
