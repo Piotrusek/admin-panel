@@ -13,74 +13,65 @@ import java.util.concurrent.*;
 
 final class MinecraftBackend implements Backend {
     private final MinecraftServer server;
-    MinecraftBackend(MinecraftServer server) { this.server = server; }
-    private <T> T onServer(Callable<T> work) throws Exception {
-        FutureTask<T> task = new FutureTask<>(work);
-        server.execute(task);
-        try { return task.get(15, TimeUnit.SECONDS); }
-        catch (TimeoutException e) { task.cancel(false); throw new BridgeFailure(503, "Game server timed out. Execution may have started; inspect the player and audit trail before retrying."); }
-        catch (ExecutionException e) { if (e.getCause() instanceof Exception cause) throw cause; throw e; }
+    private final ServerThread main;
+    private final PanelData data;
+    private final Path worldRoot;
+    private final Path playerDirectory;
+    MinecraftBackend(MinecraftServer server) {
+        this.server = server;
+        this.main = new ServerThread(server, server::isSameThread);
+        this.worldRoot = server.getWorldPath(LevelResource.ROOT);
+        this.playerDirectory = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
+        this.data = new PanelData(main, server.getServerDirectory().resolve("usercache.json"),
+                net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("tsa_anticheat"));
     }
-    // Only inspect security records; avoid building full player profiles on each poll.
-    private static boolean hasDetection(UUID id) {
-        return detectedRecord("com.zaremate.tsa_anticheat.api.TsaAnticheatAPI", "getPlayer", id, true)
-            || detectedRecord("com.zaremate.airport_security_system.AirportSecuritySystemAPI", "getPlayerOffense", id, false);
-    }
-    private static boolean detectedRecord(String api, String method, UUID id, boolean tsa) {
-        try {
-            Object optional = Class.forName(api).getMethod(method, UUID.class).invoke(null, id);
-            if (!(optional instanceof Optional<?> result) || result.isEmpty()) return false;
-            Object record = result.get();
-            if (tsa) {
-                Object detections = record.getClass().getMethod("detections").invoke(record);
-                if (detections instanceof Collection<?> found && !found.isEmpty()) return true;
-                Object count = record.getClass().getMethod("packetModified").invoke(record);
-                return count instanceof Number number && number.longValue() > 0;
-            }
-            Object count = record.getClass().getMethod("detectedChecks").invoke(record);
-            return count instanceof Number number && number.longValue() > 0;
-        } catch (ReflectiveOperationException | LinkageError ignored) {
-            // Optional integrations may not be installed.
-            return false;
-        }
+    private <T> T onServer(Callable<T> work) throws Exception { return main.call(work); }
+    private void requireWorker() {
+        if (server.isSameThread()) throw new IllegalStateException("Panel requests must run on the bridge worker");
+        if (Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException("Panel bridge stopped");
     }
     public JsonObject players() throws Exception {
-        return onServer(() -> {
-            JsonObject r = JsonParser.parseString(AdminGuiData.buildPlayerList(server)).getAsJsonObject();
-            for (JsonElement entry : r.getAsJsonArray("players")) {
-                JsonObject player = entry.getAsJsonObject();
-                player.addProperty("hasDetections", hasDetection(UUID.fromString(player.get("uuid").getAsString())));
-            }
-            r.addProperty("maxPlayers", server.getMaxPlayers());
-            r.addProperty("version", server.getServerVersion());
-            r.addProperty("punishAvailable", ModList.get().isLoaded("punish"));
-            r.addProperty("updatedAt", System.currentTimeMillis());
-            return r;
-        });
+        requireWorker();
+        JsonObject result = data.buildPlayerList(server);
+        result.addProperty("maxPlayers", onServer(server::getMaxPlayers));
+        result.addProperty("version", onServer(server::getServerVersion));
+        result.addProperty("punishAvailable", ModList.get().isLoaded("punish"));
+        result.addProperty("updatedAt", System.currentTimeMillis());
+        return result;
     }
-    public JsonObject player(UUID id, StaffActor viewer) throws Exception { return onServer(() -> {
-        JsonObject result = detail(id, viewer); result.add("storage", InventoryData.read(server, id)); result.add("location", location(id));
-        // Vanilla PLAY_TIME is stored in ticks and includes offline players.
-        JsonObject playtime = new JsonObject();
-        try {
+    private record LivePlayer(JsonObject storage, JsonObject location, Long ticks) {}
+    public JsonObject player(UUID id, StaffActor viewer) throws Exception {
+        requireWorker();
+        JsonObject result = detail(id, viewer);
+        LivePlayer live = onServer(() -> {
             var online = server.getPlayerList().getPlayer(id);
-            long ticks;
-            if (online != null) {
-                ticks = server.getPlayerList().getPlayerStats(online).getValue(Stats.CUSTOM.get(Stats.PLAY_TIME));
-            } else {
-                Path file = server.getWorldPath(LevelResource.ROOT).resolve("stats").resolve(id + ".json");
-                JsonObject stats = JsonParser.parseString(Files.readString(file)).getAsJsonObject()
-                        .getAsJsonObject("stats").getAsJsonObject("minecraft:custom");
-                ticks = stats.get("minecraft:play_time").getAsLong();
-            }
-            playtime.addProperty("seconds", Math.max(0L, ticks / 20L));
-            playtime.addProperty("available", true);
-        } catch (Exception unavailable) {
-            playtime.addProperty("available", false);
+            if (online == null) return null;
+            Long ticks = null;
+            try { ticks = (long) server.getPlayerList().getPlayerStats(online).getValue(Stats.CUSTOM.get(Stats.PLAY_TIME)); }
+            catch (RuntimeException ignored) {}
+            return new LivePlayer(InventoryData.readLive(server, id), location(id), ticks);
+        });
+        if (live != null) {
+            result.add("storage", live.storage()); result.add("location", live.location());
+            result.add("playtime", playtime(live.ticks()));
+        } else {
+            SavedPlayer saved = SavedPlayer.read(playerDirectory.resolve(id + ".dat"));
+            result.add("storage", onServer(() -> InventoryData.readSaved(server, saved)));
+            result.add("location", savedLocation(saved));
+            Long ticks = null;
+            try (var reader = Files.newBufferedReader(worldRoot.resolve("stats").resolve(id + ".json"))) {
+                ticks = JsonParser.parseReader(reader).getAsJsonObject().getAsJsonObject("stats")
+                        .getAsJsonObject("minecraft:custom").get("minecraft:play_time").getAsLong();
+            } catch (Exception ignored) {}
+            result.add("playtime", playtime(ticks));
         }
-        result.add("playtime", playtime);
         return Permissions.detail(result, viewer);
-    }); }
+    }
+    private static JsonObject playtime(Long ticks) {
+        JsonObject result = new JsonObject(); result.addProperty("available", ticks != null);
+        if (ticks != null) result.addProperty("seconds", Math.max(0L, ticks / 20L));
+        return result;
+    }
     private JsonObject location(UUID id) {
         JsonObject out = new JsonObject();
         var online = server.getPlayerList().getPlayer(id);
@@ -94,49 +85,56 @@ final class MinecraftBackend implements Backend {
             out.addProperty("yaw", online.getYRot());
             return out;
         }
-        Path file = server.getWorldPath(LevelResource.PLAYER_DATA_DIR).resolve(id + ".dat");
-        if (Files.isRegularFile(file)) {
-            try {
-                CompoundTag tag = NbtIo.readCompressed(file, NbtAccounter.create(16 * 1024 * 1024));
-                ListTag pos = tag.getList("Pos", Tag.TAG_DOUBLE);
-                if (pos.size() == 3) {
-                    out.addProperty("available", true);
-                    out.addProperty("source", "saved");
-                    out.addProperty("savedAt", Files.getLastModifiedTime(file).toMillis());
-                    out.addProperty("dimension", tag.contains("Dimension", Tag.TAG_STRING) ? tag.getString("Dimension") : "Unknown");
-                    out.addProperty("x", pos.getDouble(0));
-                    out.addProperty("y", pos.getDouble(1));
-                    out.addProperty("z", pos.getDouble(2));
-                    return out;
-                }
-            } catch (Exception ignored) {
-                // Saved position is optional; never fail the entire player profile.
-            }
-        }
         out.addProperty("available", false);
         return out;
     }
-    private JsonObject detail(UUID id, StaffActor viewer) {
-        JsonObject r = JsonParser.parseString(AdminGuiData.buildPlayerDetail(server, id, viewer.uuid())).getAsJsonObject();
-        if (ModList.get().isLoaded("punish")) r.add("cases", PunishBridge.history(server, id));
+    private JsonObject savedLocation(SavedPlayer saved) {
+        JsonObject out = new JsonObject();
+        CompoundTag tag = saved.data();
+        if (tag != null) {
+            ListTag pos = tag.getList("Pos", Tag.TAG_DOUBLE);
+            if (pos.size() == 3) {
+                out.addProperty("available", true); out.addProperty("source", "saved");
+                out.addProperty("savedAt", saved.savedAt());
+                out.addProperty("dimension", tag.contains("Dimension", Tag.TAG_STRING) ? tag.getString("Dimension") : "Unknown");
+                out.addProperty("x", pos.getDouble(0)); out.addProperty("y", pos.getDouble(1)); out.addProperty("z", pos.getDouble(2));
+                return out;
+            }
+        }
+        out.addProperty("available", false); return out;
+    }
+    private JsonObject detail(UUID id, StaffActor viewer) throws Exception {
+        JsonObject r = JsonParser.parseString(data.buildPlayerDetail(server, id, viewer.uuid())).getAsJsonObject();
+        if (ModList.get().isLoaded("punish")) {
+            JsonArray snapshot = onServer(() -> PunishBridge.captureHistory(server, id));
+            JsonArray cases = new JsonArray();
+            java.util.stream.StreamSupport.stream(snapshot.spliterator(), false)
+                    .sorted(Comparator.comparingLong((JsonElement row) -> row.getAsJsonObject().get("at").getAsLong()).reversed())
+                    .forEach(cases::add);
+            r.add("cases", cases);
+        }
         else r.add("cases", new JsonArray());
         return r;
     }
     public JsonElement mutate(UUID id, StaffActor actor, String action, JsonObject b) throws Exception {
+        requireWorker();
+        Permissions.mutation(actor, action, b);
         return onServer(() -> {
-            Permissions.mutation(actor, action, b);
-            JsonObject player = detail(id, actor);
+            // Recheck ownership and target identity at execution time. Never load a full profile here.
+            String name = server.getPlayerList().getPlayer(id) != null
+                    ? server.getPlayerList().getPlayer(id).getGameProfile().getName()
+                    : server.getProfileCache().get(id).map(com.mojang.authlib.GameProfile::getName).orElse(id.toString());
             if (action.equals("punish") || action.equals("revoke") || action.equals("remove-punishment")) {
-                if (player.get("name").getAsString().equals(id.toString())) throw new IllegalArgumentException("Unknown player: choose a known server profile");
+                if (name.equals(id.toString())) throw new IllegalArgumentException("Unknown player: choose a known server profile");
                 if (!ModList.get().isLoaded("punish")) throw new BridgeFailure(409, "Punish mod is not installed");
-                return PunishBridge.mutate(server, id, player.get("name").getAsString(), actor, action, b);
+                return PunishBridge.mutate(server, id, name, actor, action, b);
             }
-            if (!player.get("notesAvailable").getAsBoolean()) throw new BridgeFailure(409, "Admin Notes mod is not installed");
+            if (!ModList.get().isLoaded("admin_notes")) throw new BridgeFailure(409, "Admin Notes mod is not installed");
             if (action.equals("note-add")) AdminGuiData.addNote(id, actor.uuid(), actor.name(), RequestFields.string(b, "text", 4000));
             else {
                 UUID note = UUID.fromString(RequestFields.string(b, "noteId", 36));
                 boolean owned = false;
-                for (JsonElement e : player.getAsJsonArray("notes")) {
+                for (JsonElement e : data.noteSnapshot(id, actor.uuid())) {
                     JsonObject n = e.getAsJsonObject();
                     if (n.get("id").getAsString().equals(note.toString()) && n.get("canEdit").getAsBoolean()) owned = true;
                 }

@@ -9,10 +9,10 @@ import java.util.*;
 
 /** Loaded only when Punish is present. Never dispatches arbitrary console commands. */
 final class PunishBridge {
-    static JsonArray history(MinecraftServer server, UUID id) {
+    static JsonArray captureHistory(MinecraftServer server, UUID id) {
         JsonArray a = new JsonArray();
         PunishMod.service(server.getServerDirectory()).db().records().stream()
-                .filter(r -> id.toString().equals(r.uuid)).sorted(Comparator.comparingLong((com.zaremate.punish.data.PunishmentRecord r) -> r.at).reversed())
+                .filter(r -> id.toString().equals(r.uuid))
                 .forEach(r -> { JsonObject row = r.toJson(); row.remove("ip"); row.remove("seenAccounts"); a.add(row); });
         return a;
     }

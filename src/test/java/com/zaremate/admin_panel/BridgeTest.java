@@ -7,7 +7,7 @@ import java.util.*;
 /** Current Java bridge contracts; web authentication/UI are tested against Node. */
 public final class BridgeTest {
     public static void main(String[] args) throws Exception {
-        int checks = ModerationTest.run() + PunishmentRemovalTest.run() + BridgeBatchesTest.run();
+        int checks = ThreadingTest.run() + ModerationTest.run() + PunishmentRemovalTest.run() + BridgeBatchesTest.run();
         checks += configChecks();
         for(String value:List.of("null","42","true","{}","[]","\"\"","\"  \"","\"bad\\tfield\"")){
             var body=new JsonObject();body.add("value",JsonParser.parseString(value));

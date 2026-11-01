@@ -16,7 +16,11 @@ final class BridgeClient implements AutoCloseable {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     private final ScheduledExecutorService reconnect = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(32), new ThreadPoolExecutor.AbortPolicy());
+            new ArrayBlockingQueue<>(32), runnable -> {
+                Thread thread = new Thread(runnable, "admin-panel-worker");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
     private final Map<String, Watch> watches = new HashMap<>();
     private final java.util.concurrent.atomic.AtomicBoolean sampling = new java.util.concurrent.atomic.AtomicBoolean();
     private record Watch(String operation, UUID player, StaffActor actor, String previous) {}

@@ -168,3 +168,27 @@ The optional [Discord bot](discord-bot/README.md) runs separately from Minecraft
 To start both services in a detached tmux session, run `./start.sh` from this checkout (or use its absolute path). It creates three panes: web server, interactive shell, and Discord bot. Attach with `tmux attach -t admin-panel`. Repeated runs leave an existing session alone; exited services leave a shell open for inspecting errors.
 
 Install tmux and Node.js 22.12+, configure each service's `.env`, and run `npm ci` and `npm run build` in both `web-server/` and `discord-bot/` first. The script uses its own directory as the project path and runs as `zaremate`; edit `RUN_AS` if needed. Root launches switch to that user with `runuser`. For cron, use the absolute script path and ensure Node/npm and tmux are on the cron `PATH` (shell-based Node version managers are not loaded automatically).
+
+
+### Bridge threading
+
+Panel requests and live subscriptions run on the bounded bridge worker. Player
+list sorting, profile-cache file reads, TSA report parsing, offline player NBT
+reads/decompression, offline playtime reads, response assembly, permission filtering,
+and WebSocket serialization run there. TSA 1.x reports are read once per second at
+most per bridge instance; no legacy TSA `getPlayer()`/`getPlayers()` call is made,
+so a server with the older blocking TSA API does not scan files on its tick thread.
+Detection changes may take a refresh interval plus worker backlog to appear.
+
+Small server-thread captures retain ownership of live players, inventories, Curios,
+team/ClockIn/Discord/ASS state, and Punish snapshots. Saved item component codecs
+also run on the server thread after the worker has read and decompressed NBT.
+Moderation and note mutations remain on the server thread to preserve the owning
+mods' live-state and authorization behavior; those mods may perform persistence
+inside their own mutation APIs. Mutations no longer load a full player profile or
+TSA history first. Server captures time out after 15 seconds; queued captures and
+mutations are cancelled when the bridge shuts down or the wait times out. Already
+started mutations cannot be rolled back automatically.
+
+The web service already performs its HTTP/database work outside Minecraft. These
+changes affect the Java bridge; deploy the rebuilt mod and restart Minecraft.

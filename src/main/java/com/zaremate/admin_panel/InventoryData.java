@@ -6,16 +6,14 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.*;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.fml.ModList;
 import net.neoforged.neoforge.items.IItemHandler;
-import java.nio.file.*;
 import java.util.*;
 import java.util.function.IntFunction;
 
 /** Read-only snapshots. Never loads an offline player entity or writes player data. */
 final class InventoryData {
-    static JsonObject read(MinecraftServer server, UUID id) {
+    static JsonObject readLive(MinecraftServer server, UUID id) {
         var online = server.getPlayerList().getPlayer(id);
         JsonObject result = new JsonObject();
         result.addProperty("source", online == null ? "saved" : "live");
@@ -26,16 +24,21 @@ final class InventoryData {
             result.add("curios", curios(online));
             return result;
         }
+        throw new IllegalStateException("Live inventory requested for an offline player");
+    }
+    // Registry/component codecs remain on the server thread; disk read and decompression already finished.
+    static JsonObject readSaved(MinecraftServer server, SavedPlayer saved) {
+        JsonObject result = new JsonObject();
+        result.addProperty("source", "saved"); result.addProperty("capturedAt", System.currentTimeMillis());
         result.add("curios", unavailable("Curios inspection requires an online player."));
-        Path file = server.getWorldPath(LevelResource.PLAYER_DATA_DIR).resolve(id + ".dat");
-        if (!Files.isRegularFile(file)) {
-            result.add("inventory", unavailable("No saved inventory found. The player must join this server first."));
-            result.add("enderChest", unavailable("No saved Ender Chest found."));
+        if (saved.data() == null) {
+            result.add("inventory", unavailable(saved.error()));
+            result.add("enderChest", unavailable(saved.error()));
             return result;
         }
         try {
-            CompoundTag data = NbtIo.readCompressed(file, NbtAccounter.create(16 * 1024 * 1024));
-            result.addProperty("savedAt", Files.getLastModifiedTime(file).toMillis());
+            CompoundTag data = saved.data();
+            result.addProperty("savedAt", saved.savedAt());
             ItemStack[] items = empty(41), ender = empty(27);
             if (data.contains("Inventory", Tag.TAG_LIST)) {
                 for (Tag raw : data.getList("Inventory", Tag.TAG_COMPOUND)) {
