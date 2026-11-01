@@ -13,10 +13,14 @@ test('suggestion routes require view and tag permissions and bound tag edits bef
   assert.equal((await get('/api/suggestions')).statusCode,403);assert.equal(commands.length,0);
   account.permissions.push('tab.suggestions');staff=await login(f);assert.equal((await get('/api/suggestions')).statusCode,200);assert.equal(commands[0].action,'suggestions-list');assert.deepEqual(commands[0].tags,[]);
   assert.equal((await get('/api/suggestions?tags=invalid')).statusCode,400);assert.equal((await get('/api/suggestions?untagged=invalid')).statusCode,400);assert.equal((await get('/api/suggestions?untagged=true&tags=12345678901234568')).statusCode,400);
-  assert.equal((await post([])).statusCode,403);assert.equal((await get('/api/suggestions/12345678901234567/messages')).statusCode,200);assert.equal(commands[1].action,'suggestions-history');
+  assert.equal((await get('/api/suggestions?q='+encodeURIComponent('spawn station'))).statusCode,200);
+  assert.equal(commands.at(-1).action,'suggestions-list');
+  assert.equal(commands.at(-1).query,'spawn station');
+  assert.equal((await get('/api/suggestions?q='+encodeURIComponent('x'.repeat(161)))).statusCode,400);
+  assert.equal((await post([])).statusCode,403);assert.equal((await get('/api/suggestions/12345678901234567/messages')).statusCode,200);assert.equal(commands.at(-1).action,'suggestions-history');
   account.permissions.push('suggestions.tags');staff=await login(f);
   assert.equal((await post(Array(6).fill('12345678901234568'))).statusCode,400);assert.equal((await post(['bad'])).statusCode,400);
-  assert.equal((await post(['12345678901234568'])).statusCode,200);assert.equal(commands[2].action,'suggestions-tags');
+  assert.equal((await post(['12345678901234568'])).statusCode,200);assert.equal(commands.at(-1).action,'suggestions-tags');
   assert(f.audit.recent().some(r=>r.action==='suggestion-tags'&&r.state==='success'));
  }finally{bot?.terminate();await f.close();}
 });

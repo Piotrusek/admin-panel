@@ -72,14 +72,15 @@ export async function createApp(config:Config, options:{bridge?:Bridge;fetcher?:
     const user=req.panelSession!.user,action=req.params.action;if(!['edit','delete'].includes(action))throw new Failure(404,'Not found');requirePermission(user,'tab.todo');requirePermission(user,'todo.'+action);
     const result=await todos.mutate(user.name,req.body,uuid(req.params.id),action==='delete');await audit.write(user.name,'todo-'+action,req.params.id,'success',result);return result;
   });
-  app.get<{Querystring:{archived?:string;cursor?:string;tags?:string;untagged?:string}}>('/api/suggestions',async req=>{
+  app.get<{Querystring:{archived?:string;cursor?:string;tags?:string;untagged?:string;q?:string}}>('/api/suggestions',async req=>{
     requirePermission(req.panelSession!.user,'tab.suggestions');
     if(req.query.archived!==undefined&&!['true','false'].includes(req.query.archived))throw new Failure(400,'Invalid archive filter');
     if(req.query.cursor!==undefined&&!/^[0-9]{1,16}$/.test(req.query.cursor))throw new Failure(400,'Invalid cursor');
     if(req.query.untagged!==undefined&&!['true','false'].includes(req.query.untagged))throw new Failure(400,'Invalid untagged filter');
+    if(req.query.q!==undefined&&(typeof req.query.q!=='string'||req.query.q.length>160))throw new Failure(400,'Search query is too long');
     const tags=req.query.tags?req.query.tags.split(','):[];
     if(req.query.untagged==='true'&&tags.length>0||tags.length>20||!tags.every(id=>/^[1-9][0-9]{16,19}$/.test(id))||new Set(tags).size!==tags.length)throw new Failure(400,'Invalid tag filters');
-    const result=await ticketBridge.request({action:'suggestions-list',archived:req.query.archived==='true',cursor:req.query.cursor,tags,untagged:req.query.untagged==='true'}) as {messages:unknown[];hasMore:boolean};
+    const result=await ticketBridge.request({action:'suggestions-list',archived:req.query.archived==='true',cursor:req.query.cursor,tags,untagged:req.query.untagged==='true',query:req.query.q?.trim()||undefined}) as {messages:unknown[];hasMore:boolean};
     return {meta:result.messages[0],threads:result.messages.slice(1),hasMore:result.hasMore};
   });
   app.get<{Params:{id:string};Querystring:{before?:string}}>('/api/suggestions/:id/messages',async req=>{
