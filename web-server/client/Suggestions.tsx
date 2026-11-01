@@ -28,6 +28,11 @@ export function Suggestions({api,session}:{api:Api;session:Session}) {
   return()=>{stopped=true;};
  },[api,archived,cursor,refresh,filterKey,key,untagged,query]);
 
+ useEffect(()=>{
+  if(!query||!page?.meta.indexing||!ready)return;
+  const timer=setTimeout(()=>{cache.current.delete(key);setRefresh(v=>v+1);},2000);
+  return()=>clearTimeout(timer);
+ },[query,page?.meta.indexing,page?.meta.indexed,key,ready]);
  const visible=page?.threads??[];
  const names=(ids:string[])=>ids.map(id=>page?.meta.tags.find(t=>t.id===id)?.name??'Unknown tag');
  return <section className="card" id="suggestions" aria-busy={loading}><div className="section-header"><div><h2>{page?.meta.name??'Server suggestions'}</h2><p className="muted">Ideas from the community. Review, label, and turn them into work.</p></div><button className="secondary" disabled={busy} onClick={()=>{cache.current.clear();setRefresh(v=>v+1);}}>Refresh suggestions</button></div><div className="filter-tabs">{[false,true].map(v=><button key={String(v)} disabled={busy} className={archived===v?'selected':''} onClick={()=>{setArchived(v);setCursor('');setPrevious([]);}}>{v?'Archived':'Active'}</button>)}</div>
