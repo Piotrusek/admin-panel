@@ -1,3 +1,4 @@
+import { buildSuggestionIndex, indexSuggestionMessage, invalidateSuggestionThread, removeSuggestionThread } from './suggestions.js';
 import { errorDetail } from './errors.js';
 import { connectConversations } from './conversations.js';
 import { Client, Events, GatewayIntentBits } from 'discord.js';
@@ -20,6 +21,7 @@ try {
       const guild=await ready.guilds.fetch(config.guildId);
       await printGuildChannels(guild);
       stopConversations=connectConversations(guild,tickets);
+      void buildSuggestionIndex(guild,tickets).catch(error=>report('Suggestion index initialization failed',error));
       console.log('Channel listing complete. Bot remains online; press Ctrl+C to stop.');
       let syncing=false;
       const sync=async()=>{if(syncing)return;syncing=true;try{
@@ -30,6 +32,22 @@ try {
       if(tickets.categoryIds.length){await sync();ticketTimer=setInterval(()=>void sync(),30000);}
     })().catch(error=>{report('Channel listing failed',error);process.exitCode=1;client?.destroy();});
   });
+  client.on(Events.MessageCreate,message=>{if(message.guild)indexSuggestionMessage(message.guild,tickets,message);});
+  client.on(Events.MessageUpdate,(_old,message)=>{
+    if(message.guild&&message.channel.isThread()&&message.channel.parentId===tickets.suggestionsForumId)
+      invalidateSuggestionThread(message.guild,tickets,message.channel);
+  });
+  client.on(Events.MessageDelete,message=>{
+    if(message.guild&&message.channel.isThread()&&message.channel.parentId===tickets.suggestionsForumId)
+      invalidateSuggestionThread(message.guild,tickets,message.channel);
+  });
+  client.on(Events.MessageBulkDelete,(messages,channel)=>{
+    if(channel.isThread()&&channel.guild&&channel.parentId===tickets.suggestionsForumId)
+      invalidateSuggestionThread(channel.guild,tickets,channel);
+  });
+  client.on(Events.ThreadCreate,thread=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
+  client.on(Events.ThreadUpdate,(_old,thread)=>{if(thread.parentId===tickets.suggestionsForumId)invalidateSuggestionThread(thread.guild,tickets,thread);});
+  client.on(Events.ThreadDelete,thread=>{if(thread.parentId===tickets.suggestionsForumId)removeSuggestionThread(thread.guild,thread.id);});
   client.on(Events.Error,error=>report('Discord connection error',error));
   for(const signal of ['SIGINT','SIGTERM'] as const)process.once(signal,()=>{console.log('Stopping Discord bot.');clearInterval(ticketTimer);stopConversations();client?.destroy();});
   await client.login(config.token);
