@@ -233,7 +233,7 @@ import { buildSuggestionIndex,indexSuggestionMessage,invalidateSuggestionThread 
 test('background suggestion index finds message bodies across pages and follows new and edited messages',async()=>{
  const forumId='12345678901234567',guildId='12345678901234699',threadId='12345678901234568';
  const config=ticketConfig({SUGGESTIONS_FORUM_ID:forumId});
- const rows=new Map<string,{id:string;content:string;embeds:unknown[];attachments:Collection<string,unknown>}>();
+ const rows=new Map<string,any>();
  const add=(id:string,content:string)=>{const m={id,content,embeds:[],attachments:new Collection()};rows.set(id,m);return m;};
  add('12345678901234570','A buried blueprint mentions a hidden hangar');
  const thread:any={id:threadId,name:'Unrelated title',parentId:forumId,viewable:true,archived:false,locked:false,appliedTags:[],createdTimestamp:1,lastMessageId:'12345678901234570',
